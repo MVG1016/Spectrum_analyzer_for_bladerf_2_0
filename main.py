@@ -2,15 +2,17 @@ from bladerf import _bladerf
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from matplotlib.ticker import MaxNLocator
 
 # --- Параметры сканирования ---
-START_FREQ = 70e6   # Начальная частота (70 МГц)
-END_FREQ = 6e9    # Конечная частота (6000 МГц)
-BANDWIDTH = 40e6     # Ширина полосы (40 МГц)
-STEP = 40e6          # Шаг сканирования (40 МГц)
-SAMPLE_RATE = 40e6   # Частота дискретизации (40 МГц)
-NUM_SAMPLES = 8192 # Количество сэмплов
+START_FREQ = 70e6   # Начальная частота
+END_FREQ = 6e9      # Конечная частота
+BANDWIDTH = 40e6    # Ширина полосы
+STEP = 40e6         # Шаг сканирования
+SAMPLE_RATE = 40e6  # Частота дискретизации
+NUM_SAMPLES = 8192  # Количество сэмплов
 GAIN = 0            # Усиление (в dB)
+WATERFALL_SIZE = 100  # Количество строк в водопаде
 
 # --- Инициализация BladeRF ---
 sdr = _bladerf.BladeRF()
@@ -21,8 +23,8 @@ freq_range = rx_ch.frequency_range
 min_freq = int(freq_range.min)
 max_freq = int(freq_range.max)
 
-print(f"Min Frequency: {min_freq / 1e6} MHz")
-print(f"Max Frequency: {max_freq / 1e6} MHz")
+#print(f"Min Frequency: {min_freq / 1e6} MHz")
+#print(f"Max Frequency: {max_freq / 1e6} MHz")
 
 # --- Настройка RX ---
 rx_ch.sample_rate = int(SAMPLE_RATE)
@@ -50,21 +52,44 @@ sdr.sync_config(
 # Включение RX
 rx_ch.enable = True
 
-# --- Настройка графика ---
-fig, ax = plt.subplots(figsize=(12, 6))
-line, = ax.plot(frequencies / 1e6, spectrum, color='b', linewidth=1)
-ax.set_xlabel("Frequency (MHz)")
-ax.set_ylabel("Power (dBm)")
-ax.set_title("BladeRF 2.0 Live Spectrum Scan")
-ax.grid(True)
+# --- Настройка графиков ---
+fig = plt.figure(figsize=(12, 8))
+# Используем GridSpec для управления расположением графиков
+gs = plt.GridSpec(3, 1, height_ratios=[2, 0.1, 1])  # 2 части для спектра, 0.1 для colorbar, 1 для водопада
 
-# --- Инициализация маркера для максимального значения ---
-max_marker, = ax.plot([], [], 'ro', label='Max Power')  # Красный маркер для максимума
-max_text = ax.text(0.05, 0.95, "", transform=ax.transAxes, ha="left", va="top", fontsize=12, color='r')
+# График спектра
+ax1 = fig.add_subplot(gs[0])
+line, = ax1.plot(frequencies / 1e6, spectrum, color='b', linewidth=1)
+ax1.set_xlabel("Frequency (MHz)")
+ax1.set_ylabel("Power (dBm)")
+ax1.set_title("BladeRF 2.0 Live Spectrum Scan")
+ax1.grid(True)
+
+# Инициализация маркера для максимального значения
+max_marker, = ax1.plot([], [], 'ro', label='Max Power')  # Красный маркер для максимума
+max_text = ax1.text(0.05, 0.95, "", transform=ax1.transAxes, ha="left", va="top", fontsize=12, color='r')
+
+# Водопад
+ax2 = fig.add_subplot(gs[2])
+waterfall_data = np.zeros((WATERFALL_SIZE, len(frequencies)))
+waterfall = ax2.imshow(
+    waterfall_data,
+    aspect='auto',
+    cmap='viridis',
+    extent=[frequencies[0] / 1e6, frequencies[-1] / 1e6, 0, WATERFALL_SIZE]
+)
+ax2.set_xlabel("Frequency (MHz)")
+ax2.set_ylabel("Time")
+ax2.set_title("Waterfall Plot")
+
+# Цветовая шкала (colorbar) для водопада
+cbar = plt.colorbar(waterfall, cax=fig.add_subplot(gs[1]), orientation='horizontal', label="Power (dBm)")
 
 # --- Функция обновления графика с авто-масштабированием ---
+# --- Функция обновления графика с авто-масштабированием ---
 def update(frame):
-    global spectrum
+    global spectrum, waterfall_data
+
     for i, freq in enumerate(frequencies):
         rx_ch.frequency = int(freq)
         buf = bytearray(buffer_size)
@@ -76,7 +101,7 @@ def update(frame):
         power_mW = np.mean(np.abs(samples)**2)
         spectrum[i] = 10 * np.log10(power_mW)
 
-    # Обновляем данные графика
+    # Обновляем данные графика спектра
     line.set_ydata(spectrum)
 
     # Находим индекс максимального значения в спектре
@@ -91,14 +116,29 @@ def update(frame):
     max_text.set_text(f"Max: {max_freq_value:.2f} MHz, {max_power_value:.2f} dBm")
 
     # Автоматическое обновление пределов осей
-    ax.relim()  # Пересчитывает границы осей
-    ax.autoscale_view()  # Обновляет пределы
+    ax1.relim()  # Пересчитывает границы осей
+    ax1.autoscale_view()  # Обновляет пределы
 
-    return line, max_marker, max_text  # Возвращаем маркер и линию для обновления
+    # Устанавливаем пределы оси X точно в диапазоне частот
+    ax1.set_xlim(frequencies[0] / 1e6, frequencies[-1] / 1e6)
 
+    # Используем MaxNLocator для автоматической установки меток оси X
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Устанавливаем дополнительные метки для первой и последней частоты
+    ax1.set_xticks([frequencies[0] / 1e6, frequencies[-1] / 1e6] + ax1.get_xticks().tolist())
+
+    # Обновляем водопад
+    waterfall_data = np.roll(waterfall_data, -1, axis=0)  # Сдвигаем данные вверх
+    waterfall_data[-1, :] = spectrum  # Добавляем новую строку вниз
+    waterfall.set_data(waterfall_data)
+    waterfall.set_clim(vmin=np.min(spectrum), vmax=np.max(spectrum))  # Обновляем диапазон цветов
+
+    return line, max_marker, max_text, waterfall  # Возвращаем маркер, линию и водопад для обновления
 # --- Анимация обновления графика ---
 ani = animation.FuncAnimation(fig, update, interval=500, blit=False)
 
+plt.tight_layout()
 plt.show()
 
 # Завершение работы
