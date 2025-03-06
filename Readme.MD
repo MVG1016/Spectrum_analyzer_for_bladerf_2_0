@@ -1,13 +1,7 @@
 # Live Spectrum Scan with BladeRF
 
-This project demonstrates how to use the BladeRF 2.0 device to perform a live spectrum scan and visualize the results in real-time using Python. It includes an animated plot that updates continuously with the received data, highlighting the maximum power point on the spectrum.
-Features
-
-    Live spectrum scanning using the BladeRF 2.0 device.
-    Real-time plotting with matplotlib and live updates.
-    Automatic scaling of the plot based on the received data.
-    Marker indicating the maximum power point in the spectrum.
-    Display of frequency and power values of the maximum point in the legend.
+This project demonstrates how to use the BladeRF 2.0 device to perform a live spectrum scan and visualize the results in real-time using Python. 
+It includes an animated plot that updates continuously with the received data, highlighting the maximum power point on the spectrum and waterfall plot.
 
 Requirements
 
@@ -51,14 +45,9 @@ python spectrum_scan.py
 Russian
 # Сканирование спектра с BladeRF
 
-Этот проект демонстрирует, как использовать устройство BladeRF 2.0 для выполнения сканирования спектра и визуализации результатов в реальном времени с использованием Python. Он включает анимированный график, который обновляется непрерывно с полученными данными, выделяя точку максимальной мощности на спектре.
-Особенности
+Этот проект демонстрирует, как использовать устройство BladeRF 2.0 для выполнения сканирования спектра и визуализации результатов в реальном времени с использованием Python. 
+Он включает анимированный график, который обновляется непрерывно с полученными данными, выделяя точку максимальной мощности на спектре, а также режим водопад.
 
-    Живое сканирование спектра с использованием устройства BladeRF 2.0.
-    Реальное время обновления графика с использованием matplotlib.
-    Автоматическая настройка масштаба графика на основе полученных данных.
-    Маркер, указывающий на точку максимальной мощности на спектре.
-    Отображение частоты и значения мощности точки максимума в легенде.
 
 Требования
 
