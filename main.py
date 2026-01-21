@@ -310,7 +310,7 @@ class SpectrumAnalyzer(QMainWindow):
         self.stop_freq_edit = QLineEdit("2500")
         control_layout.addRow("Stop (MHz):", self.stop_freq_edit)
 
-        self.step_edit = QLineEdit("0.6")
+        self.step_edit = QLineEdit("50")
         control_layout.addRow("Step (MHz):", self.step_edit)
 
         self.samples_combo = QComboBox()
@@ -357,7 +357,7 @@ class SpectrumAnalyzer(QMainWindow):
 
         self.tx_gain_spin = QSpinBox()
         self.tx_gain_spin.setRange(0, 60)
-        self.tx_gain_spin.setValue(30)
+        self.tx_gain_spin.setValue(10)
         control_layout.addRow("TX Gain:", self.tx_gain_spin)
 
         self.tx_start_button = QPushButton("Start Transmission")
