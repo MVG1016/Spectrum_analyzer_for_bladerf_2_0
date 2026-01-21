@@ -536,8 +536,8 @@ class SpectrumAnalyzer(QMainWindow):
                     stream_timeout=self.config.SYNC_STREAM_TIMEOUT
                 )
 
-                self.tx_channel.enable = True
-                time.sleep(0.1)
+                self.tx_channel.enable = False
+                time.sleep(0.05)
 
                 self.current_tx_channel_index = channel_index
                 print(f"TX Channel {channel_index + 1} initialized")
