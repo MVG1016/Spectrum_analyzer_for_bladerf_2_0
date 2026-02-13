@@ -688,7 +688,6 @@ class SpectrumAnalyzer(QMainWindow):
                 self.live_scanning = False
 
     def init_live_scan_parameters(self):
-        """Initialize composite scan parameters"""
         try:
             start_mhz = float(self.start_freq_edit.text())
             stop_mhz = float(self.stop_freq_edit.text())
@@ -698,15 +697,13 @@ class SpectrumAnalyzer(QMainWindow):
             self.live_scanning = False
             self.scan_button.setText("Start Scanning")
             return
-
-        # Update sample rate to match step
-        self.config.sample_rate = step_mhz * 1e6
+        overlap = 1.1
+        self.config.sample_rate = step_mhz * 1e6  *overlap
 
         with self.sdr_lock:
             self.rx_channel.sample_rate = int(self.config.sample_rate)
             self.rx_channel.bandwidth = int(self.config.sample_rate)
 
-        # Calculate center frequencies
         start_hz = start_mhz * 1e6
         stop_hz = stop_mhz * 1e6
         step_hz = step_mhz * 1e6
@@ -719,58 +716,75 @@ class SpectrumAnalyzer(QMainWindow):
 
         self.wb_index = 0
 
-        # Common frequency axis (0.1 MHz resolution)
+        # Общая частотная ось
         common_res = 0.1  # MHz
         num_points = int(np.round((stop_mhz - start_mhz) / common_res)) + 1
-        self.common_freq = np.linspace(start_mhz, stop_mhz, num_points, endpoint=True)
+        self.common_freq = np.linspace(start_mhz, stop_mhz, num_points)
 
-        # Initialize spectrum arrays
+        # Один sweep = один кадр
         self.composite_spectrum = np.full(self.common_freq.shape, -140.0)
-        self.maxhold_data_arr = np.full(self.common_freq.shape, -140.0)
 
-        # Setup waterfall region
+        # Параметры realtime сегмента
+        self.segment_accum = None
+        self.segment_count = 0
+        self.segment_avg_len = 20  # ВАЖНО: dwell time
+
+        # Waterfall
         self.waterfall_img.setRect(
             QRectF(start_mhz, 0, stop_mhz - start_mhz, self.config.waterfall_lines)
         )
 
-        # Clear plots
         self.curve.clear()
         self.waterfall_data.fill(-140)
         self.waterfall_index = 0
 
-        print(f"Scan initialized: {start_mhz:.1f} - {stop_mhz:.1f} MHz, "
+        print(f"Realtime scan: {start_mhz:.1f}-{stop_mhz:.1f} MHz, "
               f"step {step_mhz:.1f} MHz, {len(self.wb_centers)} points")
 
     def composite_scan_cycle(self):
-        """Main composite scanning cycle"""
         if not self.live_scanning:
             return
 
-        if self.wb_index < len(self.wb_centers):
-            # Set new center frequency
-            new_center = self.wb_centers[self.wb_index]
-
-            with self.sdr_lock:
-                self.rx_channel.frequency = int(new_center)
-                self.center_freq = new_center
-
-            # Minimal settling time
-            QTimer.singleShot(1, self.do_composite_measurement)
-        else:
-            # All frequencies scanned, update display
+        if self.wb_index >= len(self.wb_centers):
             self.update_display()
-
-            # Reset and continue
             self.wb_index = 0
-            QTimer.singleShot(1, self.composite_scan_cycle)
+            QTimer.singleShot(0, self.composite_scan_cycle)
+            return
+
+        new_center = self.wb_centers[self.wb_index]
+
+        with self.sdr_lock:
+            self.rx_channel.frequency = int(new_center)
+            self.center_freq = new_center
+
+        # сброс сегмента
+        self.segment_accum = None
+        self.segment_count = 0
+
+        QTimer.singleShot(2, self.do_composite_measurement)
 
     def do_composite_measurement(self):
-        """Perform measurement at current frequency"""
+        if not self.live_scanning:
+            return
+
         try:
-            # Acquire spectrum
             meas_freq, meas_power = self.acquire_one_spectrum()
 
-            # Interpolate into composite spectrum
+            if self.segment_accum is None:
+                self.segment_accum = meas_power.copy()
+            else:
+                self.segment_accum += meas_power
+
+            self.segment_count += 1
+
+            # ещё наблюдаем эту частоту
+            if self.segment_count < self.segment_avg_len:
+                QTimer.singleShot(0, self.do_composite_measurement)
+                return
+
+            # формируем сегмент
+            avg_power = self.segment_accum / self.segment_count
+
             seg_min = meas_freq[0]
             seg_max = meas_freq[-1]
             mask = (self.common_freq >= seg_min) & (self.common_freq <= seg_max)
@@ -779,63 +793,64 @@ class SpectrumAnalyzer(QMainWindow):
                 interp_power = np.interp(
                     self.common_freq[mask],
                     meas_freq,
-                    meas_power,
+                    avg_power,
                     left=-140,
                     right=-140
                 )
+
+                # Clear/Write — НОРМАЛЬНО для realtime
                 self.composite_spectrum[mask] = interp_power
 
                 if self.maxhold_enabled:
-                    self.maxhold_data_arr[mask] = np.maximum(
-                        self.maxhold_data_arr[mask],
-                        interp_power
-                    )
+                    if self.maxhold_data_arr is None:
+                        self.maxhold_data_arr = self.composite_spectrum.copy()
+                    else:
+                        self.maxhold_data_arr[mask] = np.maximum(
+                            self.maxhold_data_arr[mask],
+                            interp_power
+                        )
+
+
 
         except Exception as e:
-            print(f"Error in measurement: {e}")
+            print(f"Measurement error: {e}")
 
-        # Move to next frequency
         self.wb_index += 1
-        QTimer.singleShot(1, self.composite_scan_cycle)
+        QTimer.singleShot(0, self.composite_scan_cycle)
 
     def update_display(self):
-        """Update all display elements"""
         try:
-            # Update main spectrum
             self.curve.setData(self.common_freq, self.composite_spectrum)
             self.current_x = self.common_freq.copy()
             self.current_y = self.composite_spectrum.copy()
 
-            # Update max hold
-            if self.maxhold_enabled:
+            if self.maxhold_enabled and self.maxhold_data_arr is not None:
                 self.maxhold_curve.setData(self.common_freq, self.maxhold_data_arr)
             else:
                 self.maxhold_curve.clear()
 
-            # Update peak marker
             if self.composite_spectrum.size > 0:
-                idx_peak = np.argmax(self.composite_spectrum)
-                peak_freq = self.common_freq[idx_peak]
-                peak_power = self.composite_spectrum[idx_peak]
+                idx = np.argmax(self.composite_spectrum)
+                f = self.common_freq[idx]
+                p = self.composite_spectrum[idx]
 
-                self.max_marker.setData([peak_freq], [peak_power])
-                self.max_text.setText(f"{peak_freq:.2f} MHz\n{peak_power:.1f} dBm")
-                self.max_text.setPos(peak_freq, peak_power)
+                self.max_marker.setData([f], [p])
+                self.max_text.setText(f"{f:.2f} MHz\n{p:.1f} dBm")
+                self.max_text.setPos(f, p)
 
-            # Update waterfall
             row_data = np.interp(
                 np.linspace(self.common_freq[0], self.common_freq[-1],
-                           self.config.num_samples),
+                            self.config.num_samples),
                 self.common_freq,
                 self.composite_spectrum
             )
 
             if self.waterfall_index < self.config.waterfall_lines:
-                self.waterfall_data[self.waterfall_index, :] = row_data
+                self.waterfall_data[self.waterfall_index] = row_data
                 self.waterfall_index += 1
             else:
                 self.waterfall_data = np.roll(self.waterfall_data, -1, axis=0)
-                self.waterfall_data[-1, :] = row_data
+                self.waterfall_data[-1] = row_data
 
             self.waterfall_img.setImage(
                 self.waterfall_data,
@@ -844,7 +859,7 @@ class SpectrumAnalyzer(QMainWindow):
             )
 
         except Exception as e:
-            print(f"Error updating display: {e}")
+            print(f"Display error: {e}")
 
     def toggle_maxhold(self):
         """Toggle max hold feature"""
