@@ -66,9 +66,9 @@ class SDRConfig:
     """SDR configuration parameters"""
     start_freq: float = 70e6      # 70 MHz
     stop_freq: float = 6000e6     # 6000 MHz
-    step: float = 0.53e6          # 0.53 MHz (equal to sample rate)
+    step: float = 0.6e6          # 0.53 MHz (equal to sample rate)
 
-    sample_rate: float = step     # 0.53 MHz
+    sample_rate: float = step    # 0.53 MHz
     num_samples: int = 4096
     gain: int = 30
 
@@ -87,6 +87,7 @@ CALIBRATION_TABLE = {
     400e6: -77,
     800e6: -77,
     1500e6: -77,
+    2400e6: -77,
     3000e6: -77,
     5000e6: -77
 }
@@ -592,40 +593,33 @@ class SpectrumAnalyzer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to switch TX channel: {e}")
 
     def acquire_one_spectrum(self) -> tuple:
-        """
-        Acquire one spectrum at current center frequency
-        Returns: (freq_axis, power_dbm)
-        """
         with self.sdr_lock:
             try:
-                # Read samples
                 buf = bytearray(self.config.num_samples * 4)
                 self.sdr.sync_rx(buf, self.config.num_samples)
 
-                # Convert to complex
                 samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
                 samples = samples.view(np.complex64)
                 samples /= 2048.0
 
-                # FFT
-                spectrum = np.fft.fftshift(np.fft.fft(samples))
-                power = np.abs(spectrum) ** 2 / self.config.num_samples
+                # Оконная функция Блэкмана — лучше давит боковые лепестки чем Хэннинг
+                window = np.blackman(len(samples))
+                window_power = np.sum(window ** 2)
 
-                # Calibration
+                spectrum = np.fft.fftshift(np.fft.fft(samples * window))
+                power = np.abs(spectrum) ** 2 / window_power
+
                 cal_offset = get_calibration(self.center_freq)
                 power_dbm = 10 * np.log10(power / 1e-3 + 1e-12) + cal_offset
 
-                # Frequency axis
                 f_start = (self.center_freq - self.config.sample_rate / 2) / 1e6
                 f_end = (self.center_freq + self.config.sample_rate / 2) / 1e6
-                freq_axis = np.linspace(f_start, f_end, self.config.num_samples,
-                                       endpoint=True)
+                freq_axis = np.linspace(f_start, f_end, self.config.num_samples, endpoint=True)
 
                 return freq_axis, power_dbm
 
             except Exception as e:
                 print(f"Error acquiring spectrum: {e}")
-                # Return dummy data
                 freq_axis = np.linspace(0, 1, self.config.num_samples)
                 power_dbm = np.full(self.config.num_samples, -140.0)
                 return freq_axis, power_dbm
@@ -697,8 +691,13 @@ class SpectrumAnalyzer(QMainWindow):
             self.live_scanning = False
             self.scan_button.setText("Start Scanning")
             return
-        overlap = 1.1
-        self.config.sample_rate = step_mhz * 1e6  *overlap
+        # overlap = 1.0
+        # self.config.sample_rate = step_mhz * 1e6  *overlap
+
+        trim_fraction = 0.15  # обрезка с каждой стороны
+        overlap = 1.0 / (1.0 - 2.0 * trim_fraction) * 1.05  # +5% запас
+        self.config.sample_rate = step_mhz * 1e6 * overlap
+        self.trim_fraction = trim_fraction
 
         with self.sdr_lock:
             self.rx_channel.sample_rate = int(self.config.sample_rate)
@@ -785,15 +784,24 @@ class SpectrumAnalyzer(QMainWindow):
             # формируем сегмент
             avg_power = self.segment_accum / self.segment_count
 
-            seg_min = meas_freq[0]
-            seg_max = meas_freq[-1]
+            # ---- TRIM EDGES: используем только центральные 70% сегмента ----
+            trim = int(len(meas_freq) * self.trim_fraction) # отрезаем по 15% с каждой стороны
+            if trim > 0:
+                meas_freq_use = meas_freq[trim:-trim]
+                avg_power_use = avg_power[trim:-trim]
+            else:
+                meas_freq_use = meas_freq
+                avg_power_use = avg_power
+
+            seg_min = meas_freq_use[0]
+            seg_max = meas_freq_use[-1]
             mask = (self.common_freq >= seg_min) & (self.common_freq <= seg_max)
 
             if np.any(mask):
                 interp_power = np.interp(
                     self.common_freq[mask],
-                    meas_freq,
-                    avg_power,
+                    meas_freq_use,  # <-- обрезанный диапазон
+                    avg_power_use,  # <-- обрезанные данные
                     left=-140,
                     right=-140
                 )
