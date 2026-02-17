@@ -602,7 +602,6 @@ class SpectrumAnalyzer(QMainWindow):
                 samples = samples.view(np.complex64)
                 samples /= 2048.0
 
-                # Оконная функция Блэкмана — лучше давит боковые лепестки чем Хэннинг
                 window = np.blackman(len(samples))
                 window_power = np.sum(window ** 2)
 
@@ -612,17 +611,20 @@ class SpectrumAnalyzer(QMainWindow):
                 cal_offset = get_calibration(self.center_freq)
                 power_dbm = 10 * np.log10(power / 1e-3 + 1e-12) + cal_offset
 
-                f_start = (self.center_freq - self.config.sample_rate / 2) / 1e6
-                f_end = (self.center_freq + self.config.sample_rate / 2) / 1e6
-                freq_axis = np.linspace(f_start, f_end, self.config.num_samples, endpoint=True)
-
+                # Правильная ось через fftfreq — точно совпадает с бинами FFT
+                freqs = np.fft.fftshift(
+                    np.fft.fftfreq(self.config.num_samples,
+                                   d=1.0 / self.config.sample_rate)
+                )
+                freq_axis = (freqs + self.center_freq) / 1e6  # в МГц
+                # print(f"  [FFT] center={self.center_freq / 1e6:.2f} SR={self.config.sample_rate / 1e6:.3f} "
+                #       f"axis=[{freq_axis[0]:.2f}, {freq_axis[-1]:.2f}] MHz")
                 return freq_axis, power_dbm
 
             except Exception as e:
                 print(f"Error acquiring spectrum: {e}")
                 freq_axis = np.linspace(0, 1, self.config.num_samples)
-                power_dbm = np.full(self.config.num_samples, -140.0)
-                return freq_axis, power_dbm
+                return freq_axis, np.full(self.config.num_samples, -140.0)
 
     def toggle_live_scanning(self):
         """Toggle live scanning mode"""
@@ -691,54 +693,58 @@ class SpectrumAnalyzer(QMainWindow):
             self.live_scanning = False
             self.scan_button.setText("Start Scanning")
             return
-        # overlap = 1.0
-        # self.config.sample_rate = step_mhz * 1e6  *overlap
 
-        trim_fraction = 0.15  # обрезка с каждой стороны
-        overlap = 1.0 / (1.0 - 2.0 * trim_fraction) * 1.05  # +5% запас
-        self.config.sample_rate = step_mhz * 1e6 * overlap
-        self.trim_fraction = trim_fraction
+        BLADERF_MAX_SR = 61.44e6
+        BLADERF_MIN_SR = 0.521e6
+        TRIM = 0.15  # обрезаем 15% с каждой стороны
+
+        desired_sr = step_mhz * 1e6 / (1.0 - 2.0 * TRIM) * 1.05
+        desired_sr = float(np.clip(desired_sr, BLADERF_MIN_SR, BLADERF_MAX_SR))
 
         with self.sdr_lock:
-            self.rx_channel.sample_rate = int(self.config.sample_rate)
-            self.rx_channel.bandwidth = int(self.config.sample_rate)
+            self.rx_channel.sample_rate = int(desired_sr)
+            self.rx_channel.bandwidth = int(desired_sr)
+            # ЧИТАЕМ ОБРАТНО реальное значение, которое установило железо
+            actual_sr = float(self.rx_channel.sample_rate)
+            self.config.sample_rate = actual_sr  # <-- используем РЕАЛЬНОЕ значение
+
+        # Пересчитываем trim от реального SR
+        if actual_sr > step_mhz * 1e6:
+            self.trim_fraction = 0.5 * (1.0 - (step_mhz * 1e6) / actual_sr) * 0.95
+        else:
+            self.trim_fraction = 0.0
+
+        print(f"Step={step_mhz} MHz | Requested SR={desired_sr / 1e6:.3f} MHz | "
+              f"Actual SR={actual_sr / 1e6:.3f} MHz | trim={self.trim_fraction:.4f}")
 
         start_hz = start_mhz * 1e6
         stop_hz = stop_mhz * 1e6
         step_hz = step_mhz * 1e6
 
+        # Центры строго по шагу, НЕ зависят от sample_rate
         self.wb_centers = np.arange(
-            start_hz + self.config.sample_rate / 2,
-            stop_hz - self.config.sample_rate / 2 + step_hz,
+            start_hz + step_hz / 2,
+            stop_hz,
             step_hz
         )
+        print(f"Centers (MHz): {[f'{c / 1e6:.2f}' for c in self.wb_centers]}")
 
         self.wb_index = 0
-
-        # Общая частотная ось
-        common_res = 0.1  # MHz
+        common_res = 0.1
         num_points = int(np.round((stop_mhz - start_mhz) / common_res)) + 1
         self.common_freq = np.linspace(start_mhz, stop_mhz, num_points)
-
-        # Один sweep = один кадр
         self.composite_spectrum = np.full(self.common_freq.shape, -140.0)
 
-        # Параметры realtime сегмента
         self.segment_accum = None
         self.segment_count = 0
-        self.segment_avg_len = 20  # ВАЖНО: dwell time
+        self.segment_avg_len = 20
 
-        # Waterfall
         self.waterfall_img.setRect(
             QRectF(start_mhz, 0, stop_mhz - start_mhz, self.config.waterfall_lines)
         )
-
         self.curve.clear()
         self.waterfall_data.fill(-140)
         self.waterfall_index = 0
-
-        print(f"Realtime scan: {start_mhz:.1f}-{stop_mhz:.1f} MHz, "
-              f"step {step_mhz:.1f} MHz, {len(self.wb_centers)} points")
 
     def composite_scan_cycle(self):
         if not self.live_scanning:
@@ -751,16 +757,32 @@ class SpectrumAnalyzer(QMainWindow):
             return
 
         new_center = self.wb_centers[self.wb_index]
+        print(f"[SCAN] step {self.wb_index}: tuning to {new_center / 1e6:.2f} MHz")
 
         with self.sdr_lock:
             self.rx_channel.frequency = int(new_center)
             self.center_freq = new_center
 
-        # сброс сегмента
+            # Полный сброс: нужно вычитать ВСЕ внутренние буферы целиком
+            flush_count = (self.config.SYNC_NUM_BUFFERS *
+                           self.config.BUFFER_SIZE_MULTIPLIER + 4)  # +4 запас
+
+            flush_buf = bytearray(self.config.num_samples * 4)
+            flushed = 0
+            for _ in range(flush_count):
+                try:
+                    self.sdr.sync_rx(flush_buf, self.config.num_samples)
+                    flushed += 1
+                except Exception:
+                    break
+
+            print(f"  [FLUSH] flushed {flushed}/{flush_count} reads "
+                  f"({flushed * self.config.num_samples / self.config.sample_rate * 1000:.1f} ms)")
+
         self.segment_accum = None
         self.segment_count = 0
 
-        QTimer.singleShot(2, self.do_composite_measurement)
+        QTimer.singleShot(0, self.do_composite_measurement)
 
     def do_composite_measurement(self):
         if not self.live_scanning:
@@ -785,7 +807,7 @@ class SpectrumAnalyzer(QMainWindow):
             avg_power = self.segment_accum / self.segment_count
 
             # ---- TRIM EDGES: используем только центральные 70% сегмента ----
-            trim = int(len(meas_freq) * self.trim_fraction) # отрезаем по 15% с каждой стороны
+            trim = int(len(meas_freq) * self.trim_fraction)
             if trim > 0:
                 meas_freq_use = meas_freq[trim:-trim]
                 avg_power_use = avg_power[trim:-trim]
