@@ -117,9 +117,8 @@ class TXThread(QThread):
         """Continuous transmission loop"""
         while self.running:
             try:
-                # Transmit buffer continuously
                 self.sdr.sync_tx(self.tx_buffer, len(self.tx_buffer) // 4)
-                time.sleep(0.001)  # Small delay to prevent CPU overload
+                time.sleep(0.001)
             except Exception as e:
                 print(f"TX send error: {e}")
                 time.sleep(0.01)
@@ -165,14 +164,19 @@ class SpectrumAnalyzer(QMainWindow):
         self.buffer = None
 
         # Composite scanning
-        self.wb_centers = None       # Center frequencies for sweep
+        self.wb_centers = None
         self.wb_index = 0
         self.composite_spectrum = None
-        self.common_freq = None      # Common frequency axis
+        self.common_freq = None
 
         # Max Hold
         self.maxhold_enabled = False
         self.maxhold_data_arr = None
+
+        # Calibration
+        self.segment_correction = None   # профиль АЧХ (num_samples,) в дБ
+        self.trim_fraction = 0.0
+        self.calibrating = False
 
         # Waterfall
         self.waterfall_data = None
@@ -196,7 +200,6 @@ class SpectrumAnalyzer(QMainWindow):
 
         print("State variables initialized")
 
-        # Initialize UI
         try:
             print("Creating UI...")
             self.init_ui()
@@ -207,7 +210,6 @@ class SpectrumAnalyzer(QMainWindow):
             traceback.print_exc()
             raise
 
-        # Initialize BladeRF AFTER window is shown (delayed)
         print("Scheduling BladeRF initialization...")
         QTimer.singleShot(100, self.init_bladerf_delayed)
 
@@ -236,7 +238,6 @@ class SpectrumAnalyzer(QMainWindow):
         graph_container = QWidget()
         graph_layout = QVBoxLayout(graph_container)
 
-        # Spectrum plot
         self.graph_plot = pg.PlotWidget(title="Spectrum in dBm")
         self.graph_plot.setLabel('left', 'Power', units='dBm')
         self.graph_plot.setLabel('bottom', 'Frequency', units='MHz')
@@ -244,20 +245,15 @@ class SpectrumAnalyzer(QMainWindow):
         self.graph_plot.setYRange(-140, -30)
         self.graph_plot.showGrid(x=True, y=True)
 
-        # Main spectrum curve (yellow)
         self.curve = self.graph_plot.plot(pen='y')
-
-        # Max hold curve (red)
         self.maxhold_curve = self.graph_plot.plot(pen='r')
 
-        # Peak marker
         self.max_marker = self.graph_plot.plot(
             symbol='o', symbolBrush='r', symbolSize=10
         )
         self.max_text = pg.TextItem(color='w', anchor=(0, 1))
         self.graph_plot.addItem(self.max_text)
 
-        # Cursor crosshair
         self.vLine = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('c'))
         self.hLine = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen('c'))
         self.graph_plot.addItem(self.vLine, ignoreBounds=True)
@@ -266,7 +262,6 @@ class SpectrumAnalyzer(QMainWindow):
                                        fill=pg.mkBrush(0, 0, 0, 150))
         self.graph_plot.addItem(self.cursorLabel)
 
-        # Connect mouse movement
         self.proxy = pg.SignalProxy(
             self.graph_plot.scene().sigMouseMoved,
             rateLimit=60,
@@ -275,7 +270,6 @@ class SpectrumAnalyzer(QMainWindow):
 
         graph_layout.addWidget(self.graph_plot)
 
-        # Waterfall plot
         self.waterfall_plot = pg.PlotWidget(title="Waterfall")
         self.waterfall_plot.setLabel('bottom', 'Frequency', units='MHz')
         self.waterfall_plot.setLabel('left', 'Scan')
@@ -283,7 +277,6 @@ class SpectrumAnalyzer(QMainWindow):
         self.waterfall_img = pg.ImageItem()
         self.waterfall_img.setOpts(invertY=False, axisOrder='row-major')
 
-        # Colormap
         lut = pg.colormap.get("viridis").getLookupTable(0.0, 1.0, 256)
         self.waterfall_img.setLookupTable(lut)
         self.waterfall_plot.addItem(self.waterfall_img)
@@ -296,10 +289,8 @@ class SpectrumAnalyzer(QMainWindow):
         control_panel = QWidget()
         control_layout = QFormLayout(control_panel)
 
-        # RX Settings
         control_layout.addRow(QLabel("<b>Receiver Settings</b>"))
 
-        # RX Channel selector
         self.rx_channel_combo = QComboBox()
         self.rx_channel_combo.addItems(["RX1", "RX2"])
         self.rx_channel_combo.currentIndexChanged.connect(self.on_rx_channel_changed)
@@ -338,6 +329,18 @@ class SpectrumAnalyzer(QMainWindow):
         self.maxhold_button.clicked.connect(self.toggle_maxhold)
         control_layout.addRow(self.maxhold_button)
 
+        # --- Calibration ---
+        self.calibrate_button = QPushButton("Calibrate Profile")
+        self.calibrate_button.clicked.connect(self.run_calibration)
+        control_layout.addRow(self.calibrate_button)
+
+        self.calibrate_status_label = QLabel("Not calibrated")
+        control_layout.addRow("Cal status:", self.calibrate_status_label)
+
+        self.calibrate_clear_button = QPushButton("Clear Calibration")
+        self.calibrate_clear_button.clicked.connect(self.clear_calibration)
+        control_layout.addRow(self.calibrate_clear_button)
+
         # Separator
         separator1 = QFrame()
         separator1.setFrameShape(QFrame.HLine)
@@ -347,7 +350,6 @@ class SpectrumAnalyzer(QMainWindow):
         # TX Settings
         control_layout.addRow(QLabel("<b>Transmitter Settings</b>"))
 
-        # TX Channel selector
         self.tx_channel_combo = QComboBox()
         self.tx_channel_combo.addItems(["TX1", "TX2"])
         self.tx_channel_combo.currentIndexChanged.connect(self.on_tx_channel_changed)
@@ -411,12 +413,10 @@ class SpectrumAnalyzer(QMainWindow):
                 self.sdr = _bladerf.BladeRF()
                 print(f"BladeRF device opened: {self.sdr.device_speed}")
 
-                # Initialize RX channel
                 print("Initializing RX channel...")
                 self.init_rx_channel(self.current_rx_channel_index)
                 print("RX channel initialized")
 
-                # Initialize buffer
                 print("Allocating buffer...")
                 self.buffer = np.zeros(self.config.num_samples, dtype=np.complex64)
                 print(f"Buffer allocated: {self.config.num_samples} samples")
@@ -433,7 +433,6 @@ class SpectrumAnalyzer(QMainWindow):
         """Initialize RX channel"""
         print(f"Initializing RX channel {channel_index}...")
 
-        # Disable old channel if exists
         if self.rx_channel is not None:
             try:
                 print("Disabling old RX channel...")
@@ -443,18 +442,14 @@ class SpectrumAnalyzer(QMainWindow):
                 print(f"Warning disabling old RX channel: {e}")
             time.sleep(0.2)
 
-        # Create new channel - try different approach
         print(f"Creating RX channel object for index {channel_index}...")
         try:
-            # Method 1: Direct creation
             rx_ch = _bladerf.CHANNEL_RX(channel_index)
             print(f"CHANNEL_RX enum created: {rx_ch}")
-
             self.rx_channel = self.sdr.Channel(rx_ch)
             print("RX channel object created successfully")
         except Exception as e:
             print(f"ERROR creating channel with Method 1: {e}")
-            # Method 2: Try with explicit int
             try:
                 print("Trying alternate method...")
                 if channel_index == 0:
@@ -466,28 +461,22 @@ class SpectrumAnalyzer(QMainWindow):
                 print(f"ERROR with alternate method: {e2}")
                 raise
 
-        # Configure channel
         print("Setting RX sample rate...")
         self.rx_channel.sample_rate = int(self.config.sample_rate)
         print(f"  Sample rate set: {self.config.sample_rate}")
 
         print("Setting RX bandwidth...")
         self.rx_channel.bandwidth = int(self.config.sample_rate)
-        print(f"  Bandwidth set: {self.config.sample_rate}")
 
         print("Setting RX gain mode...")
         self.rx_channel.gain_mode = _bladerf.GainMode.Manual
-        print("  Gain mode set: Manual")
 
         print("Setting RX gain...")
         self.rx_channel.gain = self.config.gain
-        print(f"  Gain set: {self.config.gain}")
 
         print("Setting RX frequency...")
         self.rx_channel.frequency = int(self.center_freq)
-        print(f"  Frequency set: {self.center_freq}")
 
-        # Configure RX streaming
         print("Configuring RX streaming...")
         self.sdr.sync_config(
             layout=_bladerf.ChannelLayout.RX_X1,
@@ -512,7 +501,6 @@ class SpectrumAnalyzer(QMainWindow):
         """Initialize TX channel"""
         try:
             with self.sdr_lock:
-                # Disable old channel if exists
                 if self.tx_channel is not None:
                     try:
                         self.tx_channel.enable = False
@@ -520,14 +508,12 @@ class SpectrumAnalyzer(QMainWindow):
                         print(f"Warning disabling old TX channel: {e}")
                     time.sleep(0.2)
 
-                # Create new channel
                 self.tx_channel = self.sdr.Channel(_bladerf.CHANNEL_TX(channel_index))
                 self.tx_channel.sample_rate = int(self.config.sample_rate)
                 self.tx_channel.bandwidth = int(self.config.sample_rate)
                 self.tx_channel.gain_mode = _bladerf.GainMode.Manual
                 self.tx_channel.gain = self.tx_gain_spin.value()
 
-                # Configure TX streaming
                 self.sdr.sync_config(
                     layout=_bladerf.ChannelLayout.TX_X1,
                     fmt=_bladerf.Format.SC16_Q11,
@@ -554,7 +540,6 @@ class SpectrumAnalyzer(QMainWindow):
         if self.sdr is None:
             return
 
-        # Stop scanning if active
         was_scanning = self.live_scanning
         if was_scanning:
             self.live_scanning = False
@@ -564,7 +549,6 @@ class SpectrumAnalyzer(QMainWindow):
             self.init_rx_channel(index)
             print(f"Switched to RX{index + 1}")
 
-            # Resume scanning if it was active
             if was_scanning:
                 QTimer.singleShot(300, lambda: self.scan_button.click())
 
@@ -576,14 +560,13 @@ class SpectrumAnalyzer(QMainWindow):
         if self.sdr is None:
             return
 
-        # Stop transmission/sweep if active
         was_transmitting = self.tx_enabled
         was_sweeping = self.sweep_enabled
 
         if was_transmitting:
-            self.start_transmission()  # Toggle off
+            self.start_transmission()
         if was_sweeping:
-            self.toggle_sweep_transmission()  # Toggle off
+            self.toggle_sweep_transmission()
 
         try:
             self.init_tx_channel(index)
@@ -593,6 +576,7 @@ class SpectrumAnalyzer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to switch TX channel: {e}")
 
     def acquire_one_spectrum(self) -> tuple:
+        """Acquire one spectrum. Applies AЧХ correction if calibrated."""
         with self.sdr_lock:
             try:
                 buf = bytearray(self.config.num_samples * 4)
@@ -611,14 +595,17 @@ class SpectrumAnalyzer(QMainWindow):
                 cal_offset = get_calibration(self.center_freq)
                 power_dbm = 10 * np.log10(power / 1e-3 + 1e-12) + cal_offset
 
-                # Правильная ось через fftfreq — точно совпадает с бинами FFT
+                # Применяем коррекцию профиля АЧХ если откалиброван
+                if (self.segment_correction is not None and
+                        len(self.segment_correction) == len(power_dbm)):
+                    power_dbm = power_dbm - self.segment_correction
+
                 freqs = np.fft.fftshift(
                     np.fft.fftfreq(self.config.num_samples,
                                    d=1.0 / self.config.sample_rate)
                 )
-                freq_axis = (freqs + self.center_freq) / 1e6  # в МГц
-                # print(f"  [FFT] center={self.center_freq / 1e6:.2f} SR={self.config.sample_rate / 1e6:.3f} "
-                #       f"axis=[{freq_axis[0]:.2f}, {freq_axis[-1]:.2f}] MHz")
+                freq_axis = (freqs + self.center_freq) / 1e6
+
                 return freq_axis, power_dbm
 
             except Exception as e:
@@ -626,40 +613,125 @@ class SpectrumAnalyzer(QMainWindow):
                 freq_axis = np.linspace(0, 1, self.config.num_samples)
                 return freq_axis, np.full(self.config.num_samples, -140.0)
 
+    # =========================================================================
+    # Calibration
+    # =========================================================================
+
+    def run_calibration(self):
+        """
+        Усредняем N спектров на текущей частоте → получаем профиль АЧХ.
+        Профиль нормируется: центральная треть сегмента = 0 дБ.
+        После этого каждый сегмент будет скорректирован на этот профиль.
+        """
+        if self.sdr is None:
+            QMessageBox.warning(self, "Error", "BladeRF not initialized")
+            return
+
+        if self.live_scanning:
+            QMessageBox.warning(self, "Error",
+                                "Stop scanning before calibration")
+            return
+
+        self.calibrating = True
+        self.calibrate_button.setEnabled(False)
+        self.calibrate_status_label.setText("Calibrating...")
+        QApplication.processEvents()
+
+        CAL_AVERAGES = 200
+
+        try:
+            # Сначала сбрасываем буфер
+            flush_buf = bytearray(self.config.num_samples * 4)
+            flush_count = (self.config.SYNC_NUM_BUFFERS *
+                           self.config.BUFFER_SIZE_MULTIPLIER + 4)
+            with self.sdr_lock:
+                for _ in range(flush_count):
+                    try:
+                        self.sdr.sync_rx(flush_buf, self.config.num_samples)
+                    except Exception:
+                        break
+
+            # Накапливаем в линейной шкале для корректного усреднения
+            accum = np.zeros(self.config.num_samples, dtype=np.float64)
+
+            for i in range(CAL_AVERAGES):
+                _, power_dbm = self.acquire_one_spectrum()
+                # Переводим в линейный масштаб перед суммированием
+                accum += 10.0 ** (power_dbm / 10.0)
+
+                if i % 20 == 0:
+                    self.calibrate_status_label.setText(
+                        f"Calibrating... {i}/{CAL_AVERAGES}")
+                    QApplication.processEvents()
+
+            # Средний профиль в дБ
+            avg_profile = 10.0 * np.log10(accum / CAL_AVERAGES)
+
+            # Опорный уровень = медиана центральной трети (там фильтр ровный)
+            n = len(avg_profile)
+            center_slice = slice(n // 3, 2 * n // 3)
+            ref_level = np.median(avg_profile[center_slice])
+
+            # Коррекция = сколько надо вычесть из каждого бина
+            # Положительная коррекция опускает бин, отрицательная поднимает
+            self.segment_correction = avg_profile - ref_level
+
+            peak_correction = max(abs(self.segment_correction.min()),
+                                  abs(self.segment_correction.max()))
+            edge_left  = self.segment_correction[:n // 8].mean()
+            edge_right = self.segment_correction[-n // 8:].mean()
+
+            print(f"Calibration done.")
+            print(f"  Ref level: {ref_level:.1f} dBm")
+            print(f"  Profile range: {self.segment_correction.min():.2f} .. "
+                  f"{self.segment_correction.max():.2f} dB")
+            print(f"  Edge correction left={edge_left:.2f} dB  "
+                  f"right={edge_right:.2f} dB")
+
+            self.calibrate_status_label.setText(
+                f"OK  peak±{peak_correction:.1f} dB  "
+                f"L{edge_left:+.1f} R{edge_right:+.1f} dB"
+            )
+
+        except Exception as e:
+            print(f"Calibration error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.segment_correction = None
+            self.calibrate_status_label.setText(f"Error: {e}")
+
+        finally:
+            self.calibrating = False
+            self.calibrate_button.setEnabled(True)
+
+    def clear_calibration(self):
+        """Remove АЧХ correction"""
+        self.segment_correction = None
+        self.calibrate_status_label.setText("Not calibrated")
+        print("Calibration cleared")
+
+    # =========================================================================
+    # Scanning
+    # =========================================================================
+
     def toggle_live_scanning(self):
         """Toggle live scanning mode"""
         if self.live_scanning:
-            # Stop scanning
             self.live_scanning = False
             self.scan_button.setText("Start Scanning")
         else:
-            # Start scanning
             try:
-                # Update parameters
                 self.config.num_samples = int(self.samples_combo.currentText())
                 self.config.waterfall_lines = self.waterfall_lines_spin.value()
                 self.config.gain = self.gain_spin.value()
 
-                # Reconfigure RX
                 with self.sdr_lock:
                     self.rx_channel.enable = False
                     time.sleep(0.1)
-
                     self.rx_channel.gain = self.config.gain
-
-                    self.sdr.sync_config(
-                        layout=_bladerf.ChannelLayout.RX_X1,
-                        fmt=_bladerf.Format.SC16_Q11,
-                        num_buffers=self.config.SYNC_NUM_BUFFERS,
-                        buffer_size=self.config.num_samples * self.config.BUFFER_SIZE_MULTIPLIER,
-                        num_transfers=self.config.SYNC_NUM_TRANSFERS,
-                        stream_timeout=self.config.SYNC_STREAM_TIMEOUT
-                    )
-
                     self.rx_channel.enable = True
                     time.sleep(0.05)
 
-                # Initialize waterfall
                 self.waterfall_data = np.full(
                     (self.config.waterfall_lines, self.config.num_samples),
                     -140.0
@@ -671,7 +743,6 @@ class SpectrumAnalyzer(QMainWindow):
                     levels=(-140, -30)
                 )
 
-                # Start scanning
                 self.live_scanning = True
                 self.scan_button.setText("Pause")
                 self.init_live_scan_parameters()
@@ -686,8 +757,8 @@ class SpectrumAnalyzer(QMainWindow):
     def init_live_scan_parameters(self):
         try:
             start_mhz = float(self.start_freq_edit.text())
-            stop_mhz = float(self.stop_freq_edit.text())
-            step_mhz = float(self.step_edit.text())
+            stop_mhz  = float(self.stop_freq_edit.text())
+            step_mhz  = float(self.step_edit.text())
         except ValueError:
             QMessageBox.warning(self, "Error", "Invalid frequency values")
             self.live_scanning = False
@@ -696,17 +767,28 @@ class SpectrumAnalyzer(QMainWindow):
 
         BLADERF_MAX_SR = 61.44e6
         BLADERF_MIN_SR = 0.521e6
-        TRIM = 0.15  # обрезаем 15% с каждой стороны
+        TRIM = 0.15
 
         desired_sr = step_mhz * 1e6 / (1.0 - 2.0 * TRIM) * 1.05
         desired_sr = float(np.clip(desired_sr, BLADERF_MIN_SR, BLADERF_MAX_SR))
 
         with self.sdr_lock:
             self.rx_channel.sample_rate = int(desired_sr)
-            self.rx_channel.bandwidth = int(desired_sr)
-            # ЧИТАЕМ ОБРАТНО реальное значение, которое установило железо
+            self.rx_channel.bandwidth   = int(desired_sr)
+            # Читаем реально установленное железом значение
             actual_sr = float(self.rx_channel.sample_rate)
-            self.config.sample_rate = actual_sr  # <-- используем РЕАЛЬНОЕ значение
+            self.config.sample_rate = actual_sr
+
+            # Переконфигурируем стриминг под новый SR
+            self.sdr.sync_config(
+                layout=_bladerf.ChannelLayout.RX_X1,
+                fmt=_bladerf.Format.SC16_Q11,
+                num_buffers=self.config.SYNC_NUM_BUFFERS,
+                buffer_size=self.config.num_samples * self.config.BUFFER_SIZE_MULTIPLIER,
+                num_transfers=self.config.SYNC_NUM_TRANSFERS,
+                stream_timeout=self.config.SYNC_STREAM_TIMEOUT
+            )
+            self.rx_channel.enable = True
 
         # Пересчитываем trim от реального SR
         if actual_sr > step_mhz * 1e6:
@@ -714,29 +796,30 @@ class SpectrumAnalyzer(QMainWindow):
         else:
             self.trim_fraction = 0.0
 
-        print(f"Step={step_mhz} MHz | Requested SR={desired_sr / 1e6:.3f} MHz | "
-              f"Actual SR={actual_sr / 1e6:.3f} MHz | trim={self.trim_fraction:.4f}")
+        print(f"Step={step_mhz} MHz | Requested SR={desired_sr/1e6:.3f} MHz | "
+              f"Actual SR={actual_sr/1e6:.3f} MHz | trim={self.trim_fraction:.4f}")
 
         start_hz = start_mhz * 1e6
-        stop_hz = stop_mhz * 1e6
-        step_hz = step_mhz * 1e6
+        stop_hz  = stop_mhz  * 1e6
+        step_hz  = step_mhz  * 1e6
 
-        # Центры строго по шагу, НЕ зависят от sample_rate
+        # Центры строго по шагу, не зависят от SR
         self.wb_centers = np.arange(
             start_hz + step_hz / 2,
             stop_hz,
             step_hz
         )
-        print(f"Centers (MHz): {[f'{c / 1e6:.2f}' for c in self.wb_centers]}")
+        print(f"Centers (MHz): {[f'{c/1e6:.1f}' for c in self.wb_centers]}")
 
         self.wb_index = 0
+
         common_res = 0.1
-        num_points = int(np.round((stop_mhz - start_mhz) / common_res)) + 1
+        num_points  = int(np.round((stop_mhz - start_mhz) / common_res)) + 1
         self.common_freq = np.linspace(start_mhz, stop_mhz, num_points)
         self.composite_spectrum = np.full(self.common_freq.shape, -140.0)
 
-        self.segment_accum = None
-        self.segment_count = 0
+        self.segment_accum   = None
+        self.segment_count   = 0
         self.segment_avg_len = 20
 
         self.waterfall_img.setRect(
@@ -745,6 +828,17 @@ class SpectrumAnalyzer(QMainWindow):
         self.curve.clear()
         self.waterfall_data.fill(-140)
         self.waterfall_index = 0
+
+        # Калибровка недействительна если изменился SR или num_samples
+        if self.segment_correction is not None:
+            if len(self.segment_correction) != self.config.num_samples:
+                self.segment_correction = None
+                self.calibrate_status_label.setText(
+                    "Recalibrate needed (FFT size changed)")
+                print("Warning: calibration reset — FFT size changed")
+            else:
+                print("Existing calibration retained (SR/trim changed, "
+                      "but profile shape is still valid)")
 
     def composite_scan_cycle(self):
         if not self.live_scanning:
@@ -757,27 +851,20 @@ class SpectrumAnalyzer(QMainWindow):
             return
 
         new_center = self.wb_centers[self.wb_index]
-        print(f"[SCAN] step {self.wb_index}: tuning to {new_center / 1e6:.2f} MHz")
 
         with self.sdr_lock:
             self.rx_channel.frequency = int(new_center)
             self.center_freq = new_center
 
-            # Полный сброс: нужно вычитать ВСЕ внутренние буферы целиком
+            # Полный сброс буфера после перестройки частоты
             flush_count = (self.config.SYNC_NUM_BUFFERS *
-                           self.config.BUFFER_SIZE_MULTIPLIER + 4)  # +4 запас
-
+                           self.config.BUFFER_SIZE_MULTIPLIER + 4)
             flush_buf = bytearray(self.config.num_samples * 4)
-            flushed = 0
             for _ in range(flush_count):
                 try:
                     self.sdr.sync_rx(flush_buf, self.config.num_samples)
-                    flushed += 1
                 except Exception:
                     break
-
-            print(f"  [FLUSH] flushed {flushed}/{flush_count} reads "
-                  f"({flushed * self.config.num_samples / self.config.sample_rate * 1000:.1f} ms)")
 
         self.segment_accum = None
         self.segment_count = 0
@@ -798,15 +885,13 @@ class SpectrumAnalyzer(QMainWindow):
 
             self.segment_count += 1
 
-            # ещё наблюдаем эту частоту
             if self.segment_count < self.segment_avg_len:
                 QTimer.singleShot(0, self.do_composite_measurement)
                 return
 
-            # формируем сегмент
             avg_power = self.segment_accum / self.segment_count
 
-            # ---- TRIM EDGES: используем только центральные 70% сегмента ----
+            # Обрезаем края сегмента
             trim = int(len(meas_freq) * self.trim_fraction)
             if trim > 0:
                 meas_freq_use = meas_freq[trim:-trim]
@@ -822,13 +907,12 @@ class SpectrumAnalyzer(QMainWindow):
             if np.any(mask):
                 interp_power = np.interp(
                     self.common_freq[mask],
-                    meas_freq_use,  # <-- обрезанный диапазон
-                    avg_power_use,  # <-- обрезанные данные
+                    meas_freq_use,
+                    avg_power_use,
                     left=-140,
                     right=-140
                 )
 
-                # Clear/Write — НОРМАЛЬНО для realtime
                 self.composite_spectrum[mask] = interp_power
 
                 if self.maxhold_enabled:
@@ -839,8 +923,6 @@ class SpectrumAnalyzer(QMainWindow):
                             self.maxhold_data_arr[mask],
                             interp_power
                         )
-
-
 
         except Exception as e:
             print(f"Measurement error: {e}")
@@ -907,26 +989,19 @@ class SpectrumAnalyzer(QMainWindow):
         """Start/stop single tone transmission"""
         if not self.tx_enabled:
             try:
-                # Get parameters
                 tx_freq = float(self.tx_freq_edit.text()) * 1e6
                 tx_gain = self.tx_gain_spin.value()
 
-                # Initialize TX channel if needed
                 if self.tx_channel is None:
                     self.init_tx_channel(self.current_tx_channel_index)
 
-                # IMPORTANT: Reconfigure for TX
                 print("Configuring for TX transmission...")
                 with self.sdr_lock:
-                    # Disable channels temporarily
-                    # if self.rx_channel is not None:
-                    #     self.rx_channel.enable = False
                     if self.tx_channel is not None:
                         self.tx_channel.enable = False
 
                     time.sleep(0.1)
 
-                    # Configure TX streaming (separate from RX)
                     print("Configuring TX streaming...")
                     self.sdr.sync_config(
                         layout=_bladerf.ChannelLayout.TX_X1,
@@ -936,26 +1011,21 @@ class SpectrumAnalyzer(QMainWindow):
                         num_transfers=self.config.SYNC_NUM_TRANSFERS,
                         stream_timeout=self.config.SYNC_STREAM_TIMEOUT
                     )
-                    print("TX sync configured")
 
-                    # Configure and enable TX
                     self.tx_channel.frequency = int(tx_freq)
                     self.tx_channel.gain = tx_gain
                     self.tx_channel.enable = True
                     time.sleep(0.05)
 
-                # Generate tone (1 kHz)
                 t = np.arange(self.config.num_samples)
                 tone_freq = 1000
                 signal = np.exp(1j * 2 * np.pi * tone_freq * t / self.config.sample_rate)
 
-                # Convert to SC16
                 iq = np.empty(2 * len(signal), dtype=np.int16)
                 iq[0::2] = np.clip(np.real(signal) * 2047, -2048, 2047).astype(np.int16)
                 iq[1::2] = np.clip(np.imag(signal) * 2047, -2048, 2047).astype(np.int16)
                 self.tx_buffer = iq.tobytes()
 
-                # Start TX thread
                 self.tx_thread = TXThread(self.sdr, self.tx_buffer)
                 self.tx_thread.start()
 
@@ -965,7 +1035,8 @@ class SpectrumAnalyzer(QMainWindow):
                     f"TX{self.current_tx_channel_index + 1}: {tx_freq/1e6:.2f} MHz, Gain {tx_gain}"
                 )
 
-                print(f"TX started on channel {self.current_tx_channel_index + 1} at {tx_freq/1e6:.2f} MHz")
+                print(f"TX started on channel {self.current_tx_channel_index + 1} "
+                      f"at {tx_freq/1e6:.2f} MHz")
 
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to start TX: {e}")
@@ -973,7 +1044,6 @@ class SpectrumAnalyzer(QMainWindow):
                 traceback.print_exc()
                 self.tx_enabled = False
         else:
-            # Stop transmission
             self.tx_enabled = False
 
             if self.tx_thread is not None:
@@ -983,7 +1053,6 @@ class SpectrumAnalyzer(QMainWindow):
                 if self.tx_channel is not None:
                     self.tx_channel.enable = False
 
-                # Reconfigure back to RX only if scanning
                 if self.live_scanning and self.rx_channel is not None:
                     print("Reconfiguring back to RX only...")
                     time.sleep(0.1)
@@ -1008,16 +1077,14 @@ class SpectrumAnalyzer(QMainWindow):
         """Toggle sweep transmission mode"""
         if not self.sweep_enabled:
             try:
-                # Get parameters
                 start_freq = float(self.sweep_start_edit.text()) * 1e6
-                stop_freq = float(self.sweep_stop_edit.text()) * 1e6
-                step_freq = float(self.sweep_step_edit.text()) * 1e6
+                stop_freq  = float(self.sweep_stop_edit.text()) * 1e6
+                step_freq  = float(self.sweep_step_edit.text()) * 1e6
                 dwell_time = float(self.sweep_dwell_edit.text())
 
                 if step_freq <= 0:
                     raise ValueError("Step must be positive")
 
-                # Generate frequency list
                 if start_freq < stop_freq:
                     self.sweep_freqs = np.arange(start_freq, stop_freq + step_freq, step_freq)
                 else:
@@ -1026,26 +1093,18 @@ class SpectrumAnalyzer(QMainWindow):
                 if len(self.sweep_freqs) == 0:
                     raise ValueError("Invalid sweep parameters")
 
-                # Initialize TX channel if needed
                 if self.tx_channel is None:
                     self.init_tx_channel(self.current_tx_channel_index)
 
-                # Configure TX gain
                 tx_gain = self.sweep_gain_spin.value()
 
-                # Configure for TX
                 print("Configuring for TX sweep...")
                 with self.sdr_lock:
-                    # # Disable channels temporarily
-                    # if self.rx_channel is not None:
-                    #     self.rx_channel.enable = False
                     if self.tx_channel is not None:
                         self.tx_channel.enable = False
 
                     time.sleep(0.1)
 
-                    # Configure TX streaming
-                    print("Configuring TX streaming...")
                     self.sdr.sync_config(
                         layout=_bladerf.ChannelLayout.TX_X1,
                         fmt=_bladerf.Format.SC16_Q11,
@@ -1054,40 +1113,34 @@ class SpectrumAnalyzer(QMainWindow):
                         num_transfers=self.config.SYNC_NUM_TRANSFERS,
                         stream_timeout=self.config.SYNC_STREAM_TIMEOUT
                     )
-                    print("TX sync configured")
 
-                    # Configure and enable TX
                     self.tx_channel.gain = tx_gain
                     self.tx_channel.enable = True
                     time.sleep(0.05)
 
-                # Generate tone
                 t = np.arange(self.config.num_samples)
                 tone_freq = 1000
                 signal = np.exp(1j * 2 * np.pi * tone_freq * t / self.config.sample_rate)
 
-                # Convert to SC16
                 iq = np.empty(2 * len(signal), dtype=np.int16)
                 iq[0::2] = np.clip(np.real(signal) * 2047, -2048, 2047).astype(np.int16)
                 iq[1::2] = np.clip(np.imag(signal) * 2047, -2048, 2047).astype(np.int16)
                 self.tx_buffer = iq.tobytes()
 
-                # Start TX thread
                 if self.tx_thread is None or not self.tx_thread.isRunning():
                     self.tx_thread = TXThread(self.sdr, self.tx_buffer)
                     self.tx_thread.start()
 
-                # Start sweep
                 self.sweep_enabled = True
                 self.current_sweep_freq = 0
                 self.sweep_timer.start(int(dwell_time))
 
                 self.sweep_start_button.setText("Stop Sweep")
                 self.sweep_status_label.setText(
-                    f"TX{self.current_tx_channel_index + 1} Sweep: {self.sweep_freqs[0]/1e6:.2f} MHz"
+                    f"TX{self.current_tx_channel_index + 1} Sweep: "
+                    f"{self.sweep_freqs[0]/1e6:.2f} MHz"
                 )
 
-                # Set first frequency
                 with self.sdr_lock:
                     self.tx_channel.frequency = int(self.sweep_freqs[0])
 
@@ -1100,14 +1153,12 @@ class SpectrumAnalyzer(QMainWindow):
                 traceback.print_exc()
                 self.sweep_enabled = False
         else:
-            # Stop sweep
             self.sweep_enabled = False
             self.sweep_timer.stop()
 
             self.sweep_start_button.setText("Start Sweep")
             self.sweep_status_label.setText("Sweep stopped")
 
-            # Stop TX if not used for single tone
             if not self.tx_enabled and self.tx_thread is not None:
                 self.tx_thread.stop()
 
@@ -1115,7 +1166,6 @@ class SpectrumAnalyzer(QMainWindow):
                     if self.tx_channel is not None:
                         self.tx_channel.enable = False
 
-                    # Reconfigure back to RX only if scanning
                     if self.live_scanning and self.rx_channel is not None:
                         print("Reconfiguring back to RX only...")
                         time.sleep(0.1)
@@ -1165,9 +1215,8 @@ class SpectrumAnalyzer(QMainWindow):
             self.vLine.setPos(x)
             self.hLine.setPos(mouse_point.y())
 
-            # Find nearest point
             idx = (np.abs(self.current_x - x)).argmin()
-            freq_val = self.current_x[idx]
+            freq_val  = self.current_x[idx]
             power_val = self.current_y[idx]
 
             self.cursorLabel.setText(f"{freq_val:.2f} MHz\n{power_val:.1f} dBm")
@@ -1177,30 +1226,14 @@ class SpectrumAnalyzer(QMainWindow):
         """Handle application close"""
         print("Closing application...")
 
-        # Stop scanning
         self.live_scanning = False
 
-        # Stop TX
         if self.tx_thread is not None:
             self.tx_thread.stop()
 
-        # Stop sweep
         self.sweep_timer.stop()
 
-        # Close device
         with self.sdr_lock:
-            # if self.rx_channel is not None:
-            #     try:
-            #         self.rx_channel.enable = False
-            #     except Exception as e:
-            #         print(f"Error disabling RX: {e}")
-
-            # if self.tx_channel is not None:
-            #     try:
-            #         self.tx_channel.enable = False
-            #     except Exception as e:
-            #         print(f"Error disabling TX: {e}")
-
             if self.sdr is not None:
                 try:
                     self.sdr.close()
@@ -1225,7 +1258,6 @@ def main():
     QLocale.setDefault(QLocale("C"))
     print("Qt locale set")
 
-    # Determine base path
     if getattr(sys, 'frozen', False):
         base_path = os.path.dirname(sys.executable)
         print(f"Running as frozen executable from: {base_path}")
@@ -1233,7 +1265,6 @@ def main():
         base_path = os.path.dirname(os.path.abspath(__file__))
         print(f"Running as script from: {base_path}")
 
-    # Setup logging
     log_filename = datetime.now().strftime("log_%Y-%m-%d_%H-%M-%S.txt")
     log_path = os.path.join(base_path, log_filename)
 
@@ -1248,12 +1279,10 @@ def main():
     print(f"Python version: {sys.version}")
     print(f"=================================================================")
 
-    # Create application
     print("Creating QApplication...")
     app = QApplication(sys.argv)
     print("QApplication created")
 
-    # Set icon
     if getattr(sys, 'frozen', False):
         icon_path = os.path.join(sys._MEIPASS, "bladerf2_0.ico")
     else:
@@ -1265,7 +1294,6 @@ def main():
     else:
         print(f"Warning: Icon not found at {icon_path}")
 
-    # Create and show window
     try:
         print("Creating main window...")
         window = SpectrumAnalyzer()
@@ -1285,10 +1313,10 @@ def main():
         import traceback
         traceback.print_exc()
 
-        # Try to show error dialog
         try:
             QMessageBox.critical(None, "Fatal Error",
-                               f"Application failed to start:\n{str(e)}\n\nCheck log file for details.")
+                               f"Application failed to start:\n{str(e)}\n\n"
+                               f"Check log file for details.")
         except:
             pass
 
