@@ -15,8 +15,9 @@ from typing import Optional, Dict
 from bladerf import _bladerf
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                             QPushButton, QHBoxLayout, QComboBox, QFormLayout,
-                            QLineEdit, QLabel, QMessageBox, QSpinBox, QFrame)
-from PyQt5.QtCore import QTimer, QLocale, QThread, QRectF
+                            QLineEdit, QLabel, QMessageBox, QSpinBox, QFrame,
+                            QSlider, QGroupBox)
+from PyQt5.QtCore import QTimer, QLocale, QThread, QRectF, Qt
 from PyQt5.QtGui import QIcon
 from PyQt5 import QtCore
 import pyqtgraph as pg
@@ -283,6 +284,46 @@ class SpectrumAnalyzer(QMainWindow):
         self.waterfall_plot.getViewBox().invertY(True)
 
         graph_layout.addWidget(self.waterfall_plot)
+
+        # ===== Waterfall color range sliders =====
+        wf_controls = QGroupBox("Waterfall Color Range")
+        wf_controls_layout = QHBoxLayout(wf_controls)
+
+        # Min slider
+        wf_controls_layout.addWidget(QLabel("Min:"))
+        self.wf_min_label = QLabel("-140 dBm")
+        self.wf_min_label.setMinimumWidth(70)
+        self.wf_min_slider = QSlider(Qt.Horizontal)
+        self.wf_min_slider.setRange(-180, 0)
+        self.wf_min_slider.setValue(-140)
+        self.wf_min_slider.setTickPosition(QSlider.TicksBelow)
+        self.wf_min_slider.setTickInterval(20)
+        self.wf_min_slider.valueChanged.connect(self.on_wf_range_changed)
+        wf_controls_layout.addWidget(self.wf_min_slider, stretch=1)
+        wf_controls_layout.addWidget(self.wf_min_label)
+
+        wf_controls_layout.addSpacing(20)
+
+        # Max slider
+        wf_controls_layout.addWidget(QLabel("Max:"))
+        self.wf_max_label = QLabel("-30 dBm")
+        self.wf_max_label.setMinimumWidth(70)
+        self.wf_max_slider = QSlider(Qt.Horizontal)
+        self.wf_max_slider.setRange(-180, 0)
+        self.wf_max_slider.setValue(-30)
+        self.wf_max_slider.setTickPosition(QSlider.TicksBelow)
+        self.wf_max_slider.setTickInterval(20)
+        self.wf_max_slider.valueChanged.connect(self.on_wf_range_changed)
+        wf_controls_layout.addWidget(self.wf_max_slider, stretch=1)
+        wf_controls_layout.addWidget(self.wf_max_label)
+
+        # Reset button
+        wf_reset_btn = QPushButton("Reset")
+        wf_reset_btn.setMaximumWidth(60)
+        wf_reset_btn.clicked.connect(self.reset_wf_range)
+        wf_controls_layout.addWidget(wf_reset_btn)
+
+        graph_layout.addWidget(wf_controls)
         main_layout.addWidget(graph_container, stretch=3)
 
         # ===== RIGHT: Control Panel =====
@@ -330,7 +371,7 @@ class SpectrumAnalyzer(QMainWindow):
         control_layout.addRow(self.maxhold_button)
 
         # --- Calibration ---
-        self.calibrate_button = QPushButton("Calibrate Profile")
+        self.calibrate_button = QPushButton("Calibrate Profile (AЧХ)")
         self.calibrate_button.clicked.connect(self.run_calibration)
         control_layout.addRow(self.calibrate_button)
 
@@ -967,11 +1008,44 @@ class SpectrumAnalyzer(QMainWindow):
             self.waterfall_img.setImage(
                 self.waterfall_data,
                 autoLevels=False,
-                levels=(-140, -30)
+                levels=(self.wf_min_slider.value(), self.wf_max_slider.value())
             )
 
         except Exception as e:
             print(f"Display error: {e}")
+
+    def on_wf_range_changed(self):
+        """Update waterfall color levels from sliders"""
+        wf_min = self.wf_min_slider.value()
+        wf_max = self.wf_max_slider.value()
+
+        # Не даём min >= max
+        if wf_min >= wf_max:
+            if self.sender() == self.wf_min_slider:
+                wf_min = wf_max - 1
+                self.wf_min_slider.blockSignals(True)
+                self.wf_min_slider.setValue(wf_min)
+                self.wf_min_slider.blockSignals(False)
+            else:
+                wf_max = wf_min + 1
+                self.wf_max_slider.blockSignals(True)
+                self.wf_max_slider.setValue(wf_max)
+                self.wf_max_slider.blockSignals(False)
+
+        self.wf_min_label.setText(f"{wf_min} dBm")
+        self.wf_max_label.setText(f"{wf_max} dBm")
+
+        if self.waterfall_data is not None:
+            self.waterfall_img.setImage(
+                self.waterfall_data,
+                autoLevels=False,
+                levels=(wf_min, wf_max)
+            )
+
+    def reset_wf_range(self):
+        """Reset waterfall range to defaults"""
+        self.wf_min_slider.setValue(-140)
+        self.wf_max_slider.setValue(-30)
 
     def toggle_maxhold(self):
         """Toggle max hold feature"""
