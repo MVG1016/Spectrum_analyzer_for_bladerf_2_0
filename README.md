@@ -17,8 +17,18 @@ Before using app you need to install all the necessary drivers and dll files for
 - Logging of all console output to a log file
 - Tx mode that allows you to transmit at sweep and classical modes
 
+## How to do level calibration aka smoothing
+- Start scanning on your desired band
+- Hit pause
+- Hit calibrate button
+- Hit start button again
+- You need to recalibrate every time you change any Rx settings
+- Calibration is not mandatory but it will remove effects of inner filter in bladeRF and make spectre appear smoother
+
+
 ## To Do list
 
 - Calibrate waterfall so it will readjust colors based on noise level
 - Add ability to save IQ samples on separate file
 - Split one main.py file into several for convenience
+
