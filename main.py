@@ -464,7 +464,7 @@ class SpectrumAnalyzer(QMainWindow):
 
         self.iq_duration_spin = QSpinBox()
         self.iq_duration_spin.setRange(1, 60000)
-        self.iq_duration_spin.setValue(1000)
+        self.iq_duration_spin.setValue(2)
         self.iq_duration_spin.setSuffix(" ms")
         control_layout.addRow("Duration:", self.iq_duration_spin)
 
@@ -1342,7 +1342,7 @@ class SpectrumAnalyzer(QMainWindow):
             self,
             "Save IQ Data",
             os.path.expanduser("~"),
-            "NumPy binary (*.npy);;Raw int16 IQ binary (*.bin);;CSV complex (*.csv)"
+            "CSV complex (*.csv);;Raw int16 IQ binary (*.bin);;NumPy binary (*.npy)"
         )
 
         if not filepath:
