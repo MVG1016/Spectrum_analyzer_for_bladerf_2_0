@@ -16,7 +16,7 @@ from bladerf import _bladerf
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                             QPushButton, QHBoxLayout, QComboBox, QFormLayout,
                             QLineEdit, QLabel, QMessageBox, QSpinBox, QFrame,
-                            QSlider, QGroupBox)
+                            QSlider, QGroupBox, QFileDialog)
 from PyQt5.QtCore import QTimer, QLocale, QThread, QRectF, Qt
 from PyQt5.QtGui import QIcon
 from PyQt5 import QtCore
@@ -199,6 +199,12 @@ class SpectrumAnalyzer(QMainWindow):
         self.current_x = None
         self.current_y = None
 
+        # IQ recording
+        self.iq_recording = False
+        self.iq_save_path = None
+        self.iq_samples_target = 0
+        self.iq_accum = []
+
         print("State variables initialized")
 
         try:
@@ -371,7 +377,7 @@ class SpectrumAnalyzer(QMainWindow):
         control_layout.addRow(self.maxhold_button)
 
         # --- Calibration ---
-        self.calibrate_button = QPushButton("Calibrate Profile (AЧХ)")
+        self.calibrate_button = QPushButton("Calibrate Profile")
         self.calibrate_button.clicked.connect(self.run_calibration)
         control_layout.addRow(self.calibrate_button)
 
@@ -443,6 +449,31 @@ class SpectrumAnalyzer(QMainWindow):
 
         self.sweep_status_label = QLabel("")
         control_layout.addRow("Sweep Status:", self.sweep_status_label)
+
+        # Separator
+        separator3 = QFrame()
+        separator3.setFrameShape(QFrame.HLine)
+        separator3.setFrameShadow(QFrame.Sunken)
+        control_layout.addRow(separator3)
+
+        # IQ Save
+        control_layout.addRow(QLabel("<b>IQ Data Recording</b>"))
+
+        self.iq_freq_edit = QLineEdit("2400")
+        control_layout.addRow("Center Freq (MHz):", self.iq_freq_edit)
+
+        self.iq_duration_spin = QSpinBox()
+        self.iq_duration_spin.setRange(1, 60000)
+        self.iq_duration_spin.setValue(1000)
+        self.iq_duration_spin.setSuffix(" ms")
+        control_layout.addRow("Duration:", self.iq_duration_spin)
+
+        self.iq_record_button = QPushButton("Record && Save IQ...")
+        self.iq_record_button.clicked.connect(self.start_iq_recording)
+        control_layout.addRow(self.iq_record_button)
+
+        self.iq_status_label = QLabel("Ready")
+        control_layout.addRow("IQ Status:", self.iq_status_label)
 
         main_layout.addWidget(control_panel, stretch=1)
 
@@ -1295,6 +1326,175 @@ class SpectrumAnalyzer(QMainWindow):
 
             self.cursorLabel.setText(f"{freq_val:.2f} MHz\n{power_val:.1f} dBm")
             self.cursorLabel.setPos(freq_val, power_val)
+
+    def start_iq_recording(self):
+        """Ask user for file path, then record IQ samples to .bin / .csv / .npy"""
+        if self.sdr is None:
+            QMessageBox.warning(self, "Error", "BladeRF not initialized")
+            return
+
+        if self.iq_recording:
+            QMessageBox.warning(self, "Error", "Recording already in progress")
+            return
+
+        # Диалог выбора файла
+        filepath, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save IQ Data",
+            os.path.expanduser("~"),
+            "NumPy binary (*.npy);;Raw int16 IQ binary (*.bin);;CSV complex (*.csv)"
+        )
+
+        if not filepath:
+            return  # пользователь отменил
+
+        # Определяем формат по расширению / фильтру
+        if filepath.endswith(".npy"):
+            fmt = "npy"
+        elif filepath.endswith(".csv"):
+            fmt = "csv"
+        else:
+            fmt = "bin"
+            if not filepath.endswith(".bin"):
+                filepath += ".bin"
+
+        # Параметры записи
+        try:
+            center_hz = float(self.iq_freq_edit.text()) * 1e6
+        except ValueError:
+            QMessageBox.warning(self, "Error", "Invalid center frequency")
+            return
+
+        duration_ms = self.iq_duration_spin.value()
+        num_samples = int(self.config.sample_rate * duration_ms / 1000)
+        # Округляем до кратного num_samples (размер одного чтения)
+        reads_needed = max(1, int(np.ceil(num_samples / self.config.num_samples)))
+        total_samples = reads_needed * self.config.num_samples
+
+        print(f"IQ recording: {center_hz/1e6:.3f} MHz, {duration_ms} ms, "
+              f"{total_samples} samples, format={fmt}, file={filepath}")
+
+        self.iq_save_path = filepath
+        self.iq_fmt = fmt
+        self.iq_center_hz = center_hz
+        self.iq_reads_needed = reads_needed
+        self.iq_reads_done = 0
+        self.iq_accum = []
+        self.iq_recording = True
+
+        self.iq_record_button.setEnabled(False)
+        self.iq_status_label.setText("Recording...")
+
+        # Перестраиваем приёмник на нужную частоту
+        was_scanning = self.live_scanning
+        if was_scanning:
+            self.live_scanning = False
+
+        with self.sdr_lock:
+            self.rx_channel.frequency = int(center_hz)
+            self.center_freq = center_hz
+
+            # Сброс буфера
+            flush_count = (self.config.SYNC_NUM_BUFFERS *
+                           self.config.BUFFER_SIZE_MULTIPLIER + 4)
+            flush_buf = bytearray(self.config.num_samples * 4)
+            for _ in range(flush_count):
+                try:
+                    self.sdr.sync_rx(flush_buf, self.config.num_samples)
+                except Exception:
+                    break
+
+        self._iq_was_scanning = was_scanning
+        QTimer.singleShot(0, self._iq_read_chunk)
+
+    def _iq_read_chunk(self):
+        """Read one chunk of IQ samples during recording"""
+        if not self.iq_recording:
+            return
+
+        try:
+            with self.sdr_lock:
+                buf = bytearray(self.config.num_samples * 4)
+                self.sdr.sync_rx(buf, self.config.num_samples)
+
+            samples = np.frombuffer(buf, dtype=np.int16).astype(np.float32)
+            samples = samples.view(np.complex64)
+            samples /= 2048.0
+            self.iq_accum.append(samples.copy())
+            self.iq_reads_done += 1
+
+            progress = int(self.iq_reads_done / self.iq_reads_needed * 100)
+            self.iq_status_label.setText(f"Recording... {progress}%")
+
+            if self.iq_reads_done < self.iq_reads_needed:
+                QTimer.singleShot(0, self._iq_read_chunk)
+            else:
+                self._iq_save()
+
+        except Exception as e:
+            print(f"IQ read error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.iq_recording = False
+            self.iq_record_button.setEnabled(True)
+            self.iq_status_label.setText(f"Error: {e}")
+
+    def _iq_save(self):
+        """Save accumulated IQ data to file"""
+        try:
+            all_samples = np.concatenate(self.iq_accum)
+            filepath = self.iq_save_path
+            fmt = self.iq_fmt
+
+            if fmt == "npy":
+                # complex64, легко читается: np.load(filepath)
+                np.save(filepath, all_samples)
+
+            elif fmt == "csv":
+                # Два столбца: real, imag
+                data = np.column_stack([all_samples.real, all_samples.imag])
+                np.savetxt(filepath, data, delimiter=",",
+                           header="real,imag", comments="")
+
+            else:  # bin
+                # Interleaved int16: I0 Q0 I1 Q1 ...
+                iq_int16 = np.empty(len(all_samples) * 2, dtype=np.int16)
+                iq_int16[0::2] = np.clip(all_samples.real * 2047, -2048, 2047).astype(np.int16)
+                iq_int16[1::2] = np.clip(all_samples.imag * 2047, -2048, 2047).astype(np.int16)
+                iq_int16.tofile(filepath)
+
+            # Сохраняем метаданные в текстовый файл рядом
+            meta_path = filepath.rsplit(".", 1)[0] + "_meta.txt"
+            with open(meta_path, "w") as f:
+                f.write(f"center_freq_hz={self.iq_center_hz}\n")
+                f.write(f"sample_rate_hz={self.config.sample_rate}\n")
+                f.write(f"num_samples={len(all_samples)}\n")
+                f.write(f"format={fmt}\n")
+                f.write(f"gain={self.config.gain}\n")
+                f.write(f"recorded_at={datetime.now().isoformat()}\n")
+
+            size_kb = os.path.getsize(filepath) / 1024
+            print(f"IQ saved: {filepath}  ({len(all_samples)} samples, {size_kb:.1f} KB)")
+            print(f"Metadata: {meta_path}")
+
+            self.iq_status_label.setText(
+                f"Saved {len(all_samples)} samples  ({size_kb:.0f} KB)"
+            )
+
+        except Exception as e:
+            print(f"IQ save error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.iq_status_label.setText(f"Save error: {e}")
+
+        finally:
+            self.iq_recording = False
+            self.iq_accum = []
+            self.iq_record_button.setEnabled(True)
+
+            # Возобновляем сканирование если было активно
+            if self._iq_was_scanning:
+                QTimer.singleShot(200, lambda: self.scan_button.click())
 
     def closeEvent(self, event):
         """Handle application close"""
