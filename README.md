@@ -18,5 +18,3 @@ Before using app you need to install all the necessary drivers and dll files for
 - Tx mode that allows you to transmit at sweep and classical modes
 
 
-## Important!
-In wideband scanning it is possible that displayed spectrum  will have frequency shift compared to real signal (due to digital processing in SDR). To compensate that, there is calibration data in main.py (self.calibration_table) where you can add frequency shifts.
