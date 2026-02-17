@@ -31,4 +31,5 @@ Before using app you need to install all the necessary drivers and dll files for
 - Calibrate waterfall so it will readjust colors based on noise level
 - Add ability to save IQ samples on separate file
 - Split one main.py file into several for convenience
+- Add ability to save and recover default values on GUI
 

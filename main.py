@@ -10,7 +10,6 @@ import os
 from datetime import datetime
 from threading import Lock
 from dataclasses import dataclass
-from typing import Optional, Dict
 
 from bladerf import _bladerf
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
@@ -19,7 +18,6 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                             QSlider, QGroupBox, QFileDialog)
 from PyQt5.QtCore import QTimer, QLocale, QThread, QRectF, Qt
 from PyQt5.QtGui import QIcon
-from PyQt5 import QtCore
 import pyqtgraph as pg
 
 
