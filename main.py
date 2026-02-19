@@ -10,14 +10,16 @@ import os
 from datetime import datetime
 from threading import Lock
 from dataclasses import dataclass
+from typing import Optional, Dict
 
 from bladerf import _bladerf
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
                             QPushButton, QHBoxLayout, QComboBox, QFormLayout,
                             QLineEdit, QLabel, QMessageBox, QSpinBox, QFrame,
-                            QSlider, QGroupBox, QFileDialog)
+                            QSlider, QGroupBox, QFileDialog, QScrollArea)
 from PyQt5.QtCore import QTimer, QLocale, QThread, QRectF, Qt
 from PyQt5.QtGui import QIcon
+from PyQt5 import QtCore
 import pyqtgraph as pg
 
 
@@ -375,7 +377,7 @@ class SpectrumAnalyzer(QMainWindow):
         control_layout.addRow(self.maxhold_button)
 
         # --- Calibration ---
-        self.calibrate_button = QPushButton("Calibrate Profile")
+        self.calibrate_button = QPushButton("Calibrate Profile (AЧХ)")
         self.calibrate_button.clicked.connect(self.run_calibration)
         control_layout.addRow(self.calibrate_button)
 
@@ -462,7 +464,7 @@ class SpectrumAnalyzer(QMainWindow):
 
         self.iq_duration_spin = QSpinBox()
         self.iq_duration_spin.setRange(1, 60000)
-        self.iq_duration_spin.setValue(2)
+        self.iq_duration_spin.setValue(1000)
         self.iq_duration_spin.setSuffix(" ms")
         control_layout.addRow("Duration:", self.iq_duration_spin)
 
@@ -473,7 +475,14 @@ class SpectrumAnalyzer(QMainWindow):
         self.iq_status_label = QLabel("Ready")
         control_layout.addRow("IQ Status:", self.iq_status_label)
 
-        main_layout.addWidget(control_panel, stretch=1)
+        # Wrap control panel in scroll area
+        scroll = QScrollArea()
+        scroll.setWidget(control_panel)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        main_layout.addWidget(scroll, stretch=1)
 
     def init_bladerf(self):
         """Initialize BladeRF device"""
@@ -1340,7 +1349,7 @@ class SpectrumAnalyzer(QMainWindow):
             self,
             "Save IQ Data",
             os.path.expanduser("~"),
-            "CSV complex (*.csv);;Raw int16 IQ binary (*.bin);;NumPy binary (*.npy)"
+            "NumPy binary (*.npy);;Raw int16 IQ binary (*.bin);;CSV complex (*.csv)"
         )
 
         if not filepath:
