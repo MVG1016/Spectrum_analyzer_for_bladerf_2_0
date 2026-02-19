@@ -154,6 +154,7 @@ class SpectrumAnalyzer(QMainWindow):
         self.rx_channel = None
         self.tx_channel = None
         self.sdr_lock = Lock()
+        self.is_connected = False
 
         # Current channel indices
         self.current_rx_channel_index = 0
@@ -217,8 +218,8 @@ class SpectrumAnalyzer(QMainWindow):
             traceback.print_exc()
             raise
 
-        print("Scheduling BladeRF initialization...")
-        QTimer.singleShot(100, self.init_bladerf_delayed)
+        # Don't auto-connect - user will click Connect button
+        print("Application ready. Click 'Connect' to initialize BladeRF.")
 
     def init_bladerf_delayed(self):
         """Initialize BladeRF after window is shown"""
@@ -234,6 +235,112 @@ class SpectrumAnalyzer(QMainWindow):
                 self, "BladeRF Error",
                 f"Failed to initialize BladeRF:\n{str(e)}\n\nPlease check device connection."
             )
+
+    def toggle_connection(self):
+        """Connect or disconnect BladeRF"""
+        if self.is_connected:
+            self.disconnect_bladerf()
+        else:
+            self.connect_bladerf()
+
+    def connect_bladerf(self):
+        """Connect to BladeRF device"""
+        try:
+            self.connect_button.setEnabled(False)
+            self.connection_status_label.setText("Connecting...")
+            self.connection_status_label.setStyleSheet("QLabel { color: orange; }")
+            QApplication.processEvents()
+
+            self.init_bladerf()
+
+            self.is_connected = True
+            self.connect_button.setText("Disconnect BladeRF")
+            self.connect_button.setEnabled(True)
+            self.connection_status_label.setText("Connected")
+            self.connection_status_label.setStyleSheet("QLabel { color: green; }")
+
+            print("BladeRF connected successfully")
+
+        except Exception as e:
+            print(f"ERROR connecting to BladeRF: {e}")
+            import traceback
+            traceback.print_exc()
+
+            self.is_connected = False
+            self.connect_button.setText("Connect to BladeRF")
+            self.connect_button.setEnabled(True)
+            self.connection_status_label.setText("Connection Failed")
+            self.connection_status_label.setStyleSheet("QLabel { color: red; }")
+
+            QMessageBox.critical(
+                self, "Connection Error",
+                f"Failed to connect to BladeRF:\n{str(e)}\n\nPlease check:\n"
+                "- Device is connected\n"
+                "- USB 3.0 port\n"
+                "- udev rules installed\n"
+                "- User in plugdev group"
+            )
+
+    def disconnect_bladerf(self):
+        """Disconnect from BladeRF device"""
+        try:
+            # Stop all active operations
+            if self.live_scanning:
+                self.live_scanning = False
+                self.scan_button.setText("Start Scanning")
+
+            if self.tx_enabled:
+                self.tx_enabled = False
+                if self.tx_thread is not None:
+                    self.tx_thread.stop()
+                self.tx_start_button.setText("Start Transmission")
+                self.tx_status_label.setText("")
+
+            if self.sweep_enabled:
+                self.sweep_enabled = False
+                self.sweep_timer.stop()
+                self.sweep_start_button.setText("Start Sweep")
+                self.sweep_status_label.setText("")
+
+            if self.iq_recording:
+                self.iq_recording = False
+                self.iq_record_button.setEnabled(True)
+                self.iq_status_label.setText("Ready")
+
+            # Close device
+            with self.sdr_lock:
+                if self.rx_channel is not None:
+                    try:
+                        self.rx_channel.enable = False
+                    except:
+                        pass
+                    self.rx_channel = None
+
+                if self.tx_channel is not None:
+                    try:
+                        self.tx_channel.enable = False
+                    except:
+                        pass
+                    self.tx_channel = None
+
+                if self.sdr is not None:
+                    try:
+                        self.sdr.close()
+                    except:
+                        pass
+                    self.sdr = None
+
+            self.is_connected = False
+            self.connect_button.setText("Connect to BladeRF")
+            self.connection_status_label.setText("Disconnected")
+            self.connection_status_label.setStyleSheet("QLabel { color: red; }")
+
+            print("BladeRF disconnected")
+
+        except Exception as e:
+            print(f"Error during disconnect: {e}")
+            import traceback
+            traceback.print_exc()
 
     def init_ui(self):
         """Initialize user interface"""
@@ -336,6 +443,24 @@ class SpectrumAnalyzer(QMainWindow):
         control_panel = QWidget()
         control_layout = QFormLayout(control_panel)
 
+        # Connection control
+        control_layout.addRow(QLabel("<b>Device Connection</b>"))
+
+        self.connect_button = QPushButton("Connect to BladeRF")
+        self.connect_button.setStyleSheet("QPushButton { font-weight: bold; min-height: 30px; }")
+        self.connect_button.clicked.connect(self.toggle_connection)
+        control_layout.addRow(self.connect_button)
+
+        self.connection_status_label = QLabel("Disconnected")
+        self.connection_status_label.setStyleSheet("QLabel { color: red; }")
+        control_layout.addRow("Status:", self.connection_status_label)
+
+        # Separator
+        separator0 = QFrame()
+        separator0.setFrameShape(QFrame.HLine)
+        separator0.setFrameShadow(QFrame.Sunken)
+        control_layout.addRow(separator0)
+
         control_layout.addRow(QLabel("<b>Receiver Settings</b>"))
 
         self.rx_channel_combo = QComboBox()
@@ -377,7 +502,7 @@ class SpectrumAnalyzer(QMainWindow):
         control_layout.addRow(self.maxhold_button)
 
         # --- Calibration ---
-        self.calibrate_button = QPushButton("Calibrate Profile")
+        self.calibrate_button = QPushButton("Calibrate Profile (AЧХ)")
         self.calibrate_button.clicked.connect(self.run_calibration)
         control_layout.addRow(self.calibrate_button)
 
@@ -616,6 +741,9 @@ class SpectrumAnalyzer(QMainWindow):
 
     def on_rx_channel_changed(self, index: int):
         """Handle RX channel change"""
+        if not self.is_connected:
+            return
+
         if self.sdr is None:
             return
 
@@ -636,6 +764,9 @@ class SpectrumAnalyzer(QMainWindow):
 
     def on_tx_channel_changed(self, index: int):
         """Handle TX channel change"""
+        if not self.is_connected:
+            return
+
         if self.sdr is None:
             return
 
@@ -702,6 +833,10 @@ class SpectrumAnalyzer(QMainWindow):
         Профиль нормируется: центральная треть сегмента = 0 дБ.
         После этого каждый сегмент будет скорректирован на этот профиль.
         """
+        if not self.is_connected:
+            QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
+            return
+
         if self.sdr is None:
             QMessageBox.warning(self, "Error", "BladeRF not initialized")
             return
@@ -795,6 +930,10 @@ class SpectrumAnalyzer(QMainWindow):
 
     def toggle_live_scanning(self):
         """Toggle live scanning mode"""
+        if not self.is_connected:
+            QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
+            return
+
         if self.live_scanning:
             self.live_scanning = False
             self.scan_button.setText("Start Scanning")
@@ -1099,6 +1238,10 @@ class SpectrumAnalyzer(QMainWindow):
 
     def start_transmission(self):
         """Start/stop single tone transmission"""
+        if not self.is_connected:
+            QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
+            return
+
         if not self.tx_enabled:
             try:
                 tx_freq = float(self.tx_freq_edit.text()) * 1e6
@@ -1187,6 +1330,10 @@ class SpectrumAnalyzer(QMainWindow):
 
     def toggle_sweep_transmission(self):
         """Toggle sweep transmission mode"""
+        if not self.is_connected:
+            QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
+            return
+
         if not self.sweep_enabled:
             try:
                 start_freq = float(self.sweep_start_edit.text()) * 1e6
@@ -1336,6 +1483,10 @@ class SpectrumAnalyzer(QMainWindow):
 
     def start_iq_recording(self):
         """Ask user for file path, then record IQ samples to .bin / .csv / .npy"""
+        if not self.is_connected:
+            QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
+            return
+
         if self.sdr is None:
             QMessageBox.warning(self, "Error", "BladeRF not initialized")
             return
@@ -1507,21 +1658,10 @@ class SpectrumAnalyzer(QMainWindow):
         """Handle application close"""
         print("Closing application...")
 
-        self.live_scanning = False
+        if self.is_connected:
+            self.disconnect_bladerf()
 
-        if self.tx_thread is not None:
-            self.tx_thread.stop()
-
-        self.sweep_timer.stop()
-
-        with self.sdr_lock:
-            if self.sdr is not None:
-                try:
-                    self.sdr.close()
-                except Exception as e:
-                    print(f"Error closing SDR: {e}")
-
-        print("BladeRF closed successfully")
+        print("Application closed successfully")
         event.accept()
 
 
