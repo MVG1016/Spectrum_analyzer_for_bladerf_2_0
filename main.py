@@ -377,7 +377,7 @@ class SpectrumAnalyzer(QMainWindow):
         control_layout.addRow(self.maxhold_button)
 
         # --- Calibration ---
-        self.calibrate_button = QPushButton("Calibrate Profile (AЧХ)")
+        self.calibrate_button = QPushButton("Calibrate Profile")
         self.calibrate_button.clicked.connect(self.run_calibration)
         control_layout.addRow(self.calibrate_button)
 
