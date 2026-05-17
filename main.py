@@ -3,6 +3,7 @@ BladeRF 2.0 Spectrum Analyzer - Optimized Architecture
 With channel selection and logging
 """
 
+import argparse
 import numpy as np
 import time
 import sys
@@ -83,22 +84,55 @@ class SDRConfig:
     BUFFER_SIZE_MULTIPLIER: int = 4
 
 
-# Calibration table
-CALIBRATION_TABLE = {
-    400e6: -77,
-    800e6: -77,
-    1500e6: -77,
-    2400e6: -77,
-    3000e6: -77,
-    5000e6: -77
-}
+# ----------------------------------------------------------------------------
+# Absolute calibration table: frequency → dBm offset, linearly interpolated.
+# Loaded once from absolute_calibration.csv next to this file. Falls back to a
+# flat -77 dB offset (the historical hardcoded value) if the file is missing
+# or malformed, so behavior is preserved on a fresh checkout.
+# ----------------------------------------------------------------------------
+
+ABS_CAL_FILENAME = "absolute_calibration.csv"
+
+_ABS_CAL_LOADED = False
+_ABS_CAL_FREQS = np.array([400e6, 800e6, 1500e6, 2400e6, 3000e6, 5000e6])
+_ABS_CAL_OFFSETS = np.array([-77.0, -77.0, -77.0, -77.0, -77.0, -77.0])
+
+
+def _abs_cal_default_path() -> str:
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, ABS_CAL_FILENAME)
+
+
+def _load_absolute_calibration():
+    global _ABS_CAL_LOADED, _ABS_CAL_FREQS, _ABS_CAL_OFFSETS
+    if _ABS_CAL_LOADED:
+        return
+    _ABS_CAL_LOADED = True
+    path = _abs_cal_default_path()
+    if not os.path.exists(path):
+        print(f"Note: {path} not found — using built-in flat -77 dB offset")
+        return
+    try:
+        data = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+        if data.shape[1] < 2 or len(data) == 0:
+            raise ValueError("expected columns: freq_hz, offset_db")
+        order = np.argsort(data[:, 0])
+        _ABS_CAL_FREQS = data[order, 0]
+        _ABS_CAL_OFFSETS = data[order, 1]
+        print(f"Absolute calibration loaded: {path} "
+              f"({len(_ABS_CAL_FREQS)} points, "
+              f"{_ABS_CAL_FREQS.min()/1e6:.0f}–{_ABS_CAL_FREQS.max()/1e6:.0f} MHz)")
+    except Exception as e:
+        print(f"Warning: failed to parse {path}: {e}. Using flat -77 dB.")
 
 
 def get_calibration(freq_hz: float) -> float:
-    """Get calibration offset for frequency"""
-    freqs = np.array(list(CALIBRATION_TABLE.keys()))
-    gains = np.array(list(CALIBRATION_TABLE.values()))
-    return np.interp(freq_hz, freqs, gains)
+    """Absolute-power dBm offset for the given RX frequency (interpolated)."""
+    _load_absolute_calibration()
+    return float(np.interp(freq_hz, _ABS_CAL_FREQS, _ABS_CAL_OFFSETS))
 
 
 # ============================================================================
@@ -513,6 +547,14 @@ class SpectrumAnalyzer(QMainWindow):
         self.calibrate_clear_button.clicked.connect(self.clear_calibration)
         control_layout.addRow(self.calibrate_clear_button)
 
+        self.calibrate_save_button = QPushButton("Save Calibration…")
+        self.calibrate_save_button.clicked.connect(self.on_save_calibration)
+        control_layout.addRow(self.calibrate_save_button)
+
+        self.calibrate_load_button = QPushButton("Load Calibration…")
+        self.calibrate_load_button.clicked.connect(self.on_load_calibration)
+        control_layout.addRow(self.calibrate_load_button)
+
         # Separator
         separator1 = QFrame()
         separator1.setFrameShape(QFrame.HLine)
@@ -827,11 +869,11 @@ class SpectrumAnalyzer(QMainWindow):
     # Calibration
     # =========================================================================
 
-    def run_calibration(self):
+    def run_calibration(self, averages: int = 200):
         """
-        Усредняем N спектров на текущей частоте → получаем профиль АЧХ.
-        Профиль нормируется: центральная треть сегмента = 0 дБ.
-        После этого каждый сегмент будет скорректирован на этот профиль.
+        Average N spectra at the current frequency → AЧХ (filter-shape) profile.
+        Profile is normalized so the middle third of the segment = 0 dB.
+        From then on each segment gets corrected against this profile.
         """
         if not self.is_connected:
             QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
@@ -851,7 +893,7 @@ class SpectrumAnalyzer(QMainWindow):
         self.calibrate_status_label.setText("Calibrating...")
         QApplication.processEvents()
 
-        CAL_AVERAGES = 200
+        CAL_AVERAGES = int(averages)
 
         try:
             # Сначала сбрасываем буфер
@@ -923,6 +965,87 @@ class SpectrumAnalyzer(QMainWindow):
         self.segment_correction = None
         self.calibrate_status_label.setText("Not calibrated")
         print("Calibration cleared")
+
+    def save_calibration_to_file(self, filepath: str):
+        """Persist the current segment-correction profile to a .npz file.
+
+        Stores the FFT size, sample rate, center frequency, gain and timestamp
+        alongside the array so load can verify compatibility.
+        """
+        if self.segment_correction is None:
+            raise ValueError("No calibration to save — run calibration first")
+        np.savez(
+            filepath,
+            correction=self.segment_correction,
+            sample_rate=float(self.config.sample_rate),
+            fft_size=int(self.config.num_samples),
+            center_freq=float(self.center_freq),
+            gain=int(self.config.gain),
+            timestamp=datetime.now().isoformat(),
+        )
+        print(f"Calibration saved: {filepath} "
+              f"(FFT={self.config.num_samples}, "
+              f"SR={self.config.sample_rate/1e6:.3f} MHz)")
+
+    def load_calibration_from_file(self, filepath: str) -> tuple:
+        """Load a .npz calibration. Returns (ok: bool, message: str)."""
+        try:
+            data = np.load(filepath)
+            correction = data["correction"]
+            saved_sr = float(data["sample_rate"])
+            saved_fft = int(data["fft_size"])
+        except Exception as e:
+            return False, f"Load failed: {e}"
+
+        if saved_fft != self.config.num_samples:
+            return False, (f"FFT size mismatch: file has {saved_fft}, "
+                           f"current is {self.config.num_samples}")
+
+        self.segment_correction = correction
+        sr_match = abs(saved_sr - self.config.sample_rate) < 1.0
+        if sr_match:
+            msg = (f"Loaded ({saved_fft} bins @ "
+                   f"{saved_sr/1e6:.3f} MHz SR)")
+        else:
+            msg = (f"Loaded — WARNING: SR mismatch (file "
+                   f"{saved_sr/1e6:.3f} vs current "
+                   f"{self.config.sample_rate/1e6:.3f} MHz)")
+        print(f"Calibration loaded from {filepath}: {msg}")
+        return True, msg
+
+    def on_save_calibration(self):
+        """GUI handler — Save Calibration button"""
+        if self.segment_correction is None:
+            QMessageBox.warning(self, "Error",
+                                "No calibration data — run calibration first")
+            return
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Calibration", os.path.expanduser("~"),
+            "Calibration files (*.npz)")
+        if not filepath:
+            return
+        if not filepath.endswith(".npz"):
+            filepath += ".npz"
+        try:
+            self.save_calibration_to_file(filepath)
+            self.calibrate_status_label.setText(
+                f"Saved {os.path.basename(filepath)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Save failed: {e}")
+
+    def on_load_calibration(self):
+        """GUI handler — Load Calibration button"""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Load Calibration", os.path.expanduser("~"),
+            "Calibration files (*.npz)")
+        if not filepath:
+            return
+        ok, msg = self.load_calibration_from_file(filepath)
+        if ok:
+            self.calibrate_status_label.setText(msg)
+        else:
+            QMessageBox.warning(self, "Error", msg)
+            self.calibrate_status_label.setText("Load failed")
 
     # =========================================================================
     # Scanning
@@ -1516,16 +1639,23 @@ class SpectrumAnalyzer(QMainWindow):
             if not filepath.endswith(".bin"):
                 filepath += ".bin"
 
-        # Параметры записи
         try:
             center_hz = float(self.iq_freq_edit.text()) * 1e6
         except ValueError:
             QMessageBox.warning(self, "Error", "Invalid center frequency")
             return
 
-        duration_ms = self.iq_duration_spin.value()
+        self._iq_begin_recording(filepath, fmt, center_hz,
+                                 self.iq_duration_spin.value())
+
+    def _iq_begin_recording(self, filepath: str, fmt: str,
+                            center_hz: float, duration_ms: int):
+        """Start an IQ capture given an explicit destination + parameters.
+
+        Separated from start_iq_recording so headless mode can drive it
+        without a QFileDialog.
+        """
         num_samples = int(self.config.sample_rate * duration_ms / 1000)
-        # Округляем до кратного num_samples (размер одного чтения)
         reads_needed = max(1, int(np.ceil(num_samples / self.config.num_samples)))
         total_samples = reads_needed * self.config.num_samples
 
@@ -1543,7 +1673,6 @@ class SpectrumAnalyzer(QMainWindow):
         self.iq_record_button.setEnabled(False)
         self.iq_status_label.setText("Recording...")
 
-        # Перестраиваем приёмник на нужную частоту
         was_scanning = self.live_scanning
         if was_scanning:
             self.live_scanning = False
@@ -1552,7 +1681,6 @@ class SpectrumAnalyzer(QMainWindow):
             self.rx_channel.frequency = int(center_hz)
             self.center_freq = center_hz
 
-            # Сброс буфера
             flush_count = (self.config.SYNC_NUM_BUFFERS *
                            self.config.BUFFER_SIZE_MULTIPLIER + 4)
             flush_buf = bytearray(self.config.num_samples * 4)
@@ -1666,25 +1794,324 @@ class SpectrumAnalyzer(QMainWindow):
 
 
 # ============================================================================
+# Headless (CLI) Mode
+# ============================================================================
+
+def _iq_fmt_from_path(path: str) -> tuple:
+    """Return (filepath, fmt) — coerce filepath to have correct extension."""
+    if path.endswith(".npy"):
+        return path, "npy"
+    if path.endswith(".csv"):
+        return path, "csv"
+    if not path.endswith(".bin"):
+        path += ".bin"
+    return path, "bin"
+
+
+def run_headless(args) -> int:
+    """Run the analyzer without showing a window.
+
+    Reuses SpectrumAnalyzer's device-control methods, driving them
+    through QTimer callbacks instead of UI events. Returns process exit code.
+    """
+    # Default to offscreen Qt platform so this works over SSH / in CI
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    QLocale.setDefault(QLocale("C"))
+    app = QApplication(sys.argv)
+
+    analyzer = SpectrumAnalyzer()
+    # Intentionally NOT calling analyzer.show()
+
+    exit_code = {"value": 0}
+
+    def finish(code: int = 0):
+        exit_code["value"] = code
+        try:
+            if analyzer.is_connected:
+                analyzer.disconnect_bladerf()
+        except Exception as e:
+            print(f"Warning during disconnect: {e}")
+        app.quit()
+
+    def fail(msg: str, code: int = 1):
+        print(f"ERROR: {msg}", file=sys.stderr)
+        finish(code)
+
+    def do_connect() -> bool:
+        try:
+            analyzer.connect_bladerf()
+        except Exception as e:
+            fail(f"Connect failed: {e}")
+            return False
+        if not analyzer.is_connected:
+            fail("Connect did not succeed")
+            return False
+        return True
+
+    def run_info():
+        if not do_connect():
+            return
+        sdr = analyzer.sdr
+        print("=== BladeRF Device Info ===")
+        print(f"Serial:          {sdr.get_serial()}")
+        print(f"Device speed:    {sdr.device_speed}")
+        print(f"FPGA size:       {sdr.fpga_size} KLE")
+        print(f"FPGA configured: {sdr.fpga_configured}")
+        try:
+            print(f"RX1 SR range:    {analyzer.rx_channel.sample_rate_range}")
+        except Exception:
+            pass
+        finish(0)
+
+    def run_scan():
+        if not do_connect():
+            return
+        analyzer.start_freq_edit.setText(str(args.start))
+        analyzer.stop_freq_edit.setText(str(args.stop))
+        analyzer.step_edit.setText(str(args.step))
+        analyzer.gain_spin.setValue(args.gain)
+        analyzer.samples_combo.setCurrentText(str(args.fft_size))
+        analyzer.rx_channel_combo.setCurrentIndex(args.rx_channel - 1)
+
+        analyzer.toggle_live_scanning()
+        if not analyzer.live_scanning:
+            return fail("Failed to start scanning")
+
+        if getattr(args, "cal_file", None):
+            ok, msg = analyzer.load_calibration_from_file(args.cal_file)
+            if not ok:
+                print(f"Warning: {msg} — continuing without calibration")
+            else:
+                print(f"Applied calibration: {msg}")
+
+        print(f"Scanning {args.start}–{args.stop} MHz "
+              f"(step {args.step} MHz, gain {args.gain} dB) for {args.duration}s...")
+
+        def finalize():
+            freqs = analyzer.common_freq
+            spectrum = analyzer.composite_spectrum
+            if analyzer.live_scanning:
+                analyzer.toggle_live_scanning()
+
+            if freqs is None or spectrum is None or len(freqs) == 0:
+                return fail("No spectrum data captured")
+
+            with open(args.output, "w") as f:
+                f.write("freq_mhz,power_dbm\n")
+                for fmhz, p in zip(freqs, spectrum):
+                    f.write(f"{fmhz:.4f},{p:.2f}\n")
+
+            peak = int(np.argmax(spectrum))
+            print(f"Spectrum saved: {args.output} ({len(freqs)} points)")
+            print(f"Peak: {freqs[peak]:.2f} MHz @ {spectrum[peak]:.1f} dBm")
+            print(f"Range: {spectrum.min():.1f} .. {spectrum.max():.1f} dBm")
+            finish(0)
+
+        QTimer.singleShot(int(args.duration * 1000), finalize)
+
+    def run_iq():
+        if not do_connect():
+            return
+        analyzer.gain_spin.setValue(args.gain)
+        # apply gain on the live channel
+        try:
+            with analyzer.sdr_lock:
+                analyzer.rx_channel.gain = args.gain
+        except Exception as e:
+            print(f"Warning: could not set gain: {e}")
+
+        filepath, fmt = _iq_fmt_from_path(args.output)
+        analyzer._iq_begin_recording(filepath, fmt, args.freq * 1e6, args.duration)
+
+        def poll_done():
+            if analyzer.iq_recording:
+                QTimer.singleShot(50, poll_done)
+            else:
+                finish(0)
+        QTimer.singleShot(100, poll_done)
+
+    def run_tx():
+        if not do_connect():
+            return
+        analyzer.tx_freq_edit.setText(str(args.freq))
+        analyzer.tx_gain_spin.setValue(args.gain)
+        analyzer.tx_channel_combo.setCurrentIndex(args.tx_channel - 1)
+
+        analyzer.start_transmission()
+        if not analyzer.tx_enabled:
+            return fail("Failed to start transmission")
+
+        print(f"TX{args.tx_channel}: tone at {args.freq} MHz, "
+              f"gain {args.gain} dB, holding {args.duration}s...")
+
+        def stop():
+            if analyzer.tx_enabled:
+                analyzer.start_transmission()  # toggle off
+            print("TX stopped")
+            finish(0)
+        QTimer.singleShot(int(args.duration * 1000), stop)
+
+    def run_calibrate():
+        if not do_connect():
+            return
+
+        sr_hz = args.sample_rate * 1e6
+        center_hz = args.freq * 1e6
+
+        analyzer.gain_spin.setValue(args.gain)
+        analyzer.samples_combo.setCurrentText(str(args.fft_size))
+
+        try:
+            with analyzer.sdr_lock:
+                analyzer.rx_channel.enable = False
+                time.sleep(0.05)
+                analyzer.rx_channel.sample_rate = int(sr_hz)
+                analyzer.rx_channel.bandwidth = int(sr_hz)
+                actual_sr = float(analyzer.rx_channel.sample_rate)
+                analyzer.rx_channel.gain = args.gain
+                analyzer.rx_channel.frequency = int(center_hz)
+
+                analyzer.config.sample_rate = actual_sr
+                analyzer.config.num_samples = args.fft_size
+                analyzer.config.gain = args.gain
+                analyzer.center_freq = center_hz
+
+                analyzer.sdr.sync_config(
+                    layout=_bladerf.ChannelLayout.RX_X1,
+                    fmt=_bladerf.Format.SC16_Q11,
+                    num_buffers=analyzer.config.SYNC_NUM_BUFFERS,
+                    buffer_size=analyzer.config.num_samples *
+                                analyzer.config.BUFFER_SIZE_MULTIPLIER,
+                    num_transfers=analyzer.config.SYNC_NUM_TRANSFERS,
+                    stream_timeout=analyzer.config.SYNC_STREAM_TIMEOUT,
+                )
+                analyzer.rx_channel.enable = True
+                time.sleep(0.1)
+        except Exception as e:
+            return fail(f"Failed to configure RX for calibration: {e}")
+
+        print(f"Calibrating at {args.freq} MHz "
+              f"(actual SR {actual_sr/1e6:.3f} MHz, FFT {args.fft_size}, "
+              f"gain {args.gain} dB, {args.averages} averages)…")
+
+        try:
+            analyzer.run_calibration(averages=args.averages)
+        except Exception as e:
+            return fail(f"Calibration failed: {e}")
+
+        if analyzer.segment_correction is None:
+            return fail("Calibration produced no result")
+
+        try:
+            analyzer.save_calibration_to_file(args.output)
+        except Exception as e:
+            return fail(f"Save failed: {e}")
+
+        c = analyzer.segment_correction
+        print(f"Correction range: {c.min():+.2f} .. {c.max():+.2f} dB "
+              f"(std {c.std():.2f} dB)")
+        finish(0)
+
+    dispatch = {"info": run_info, "scan": run_scan,
+                "iq": run_iq, "tx": run_tx,
+                "calibrate": run_calibrate}
+    QTimer.singleShot(0, dispatch[args.command])
+
+    app.exec_()
+    return exit_code["value"]
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="main.py",
+        description="BladeRF 2.0 wideband spectrum analyzer + signal generator. "
+                    "Launches the GUI by default; use a subcommand for headless "
+                    "automation."
+    )
+    sub = p.add_subparsers(dest="command")
+
+    sub.add_parser("info", help="Connect, print device info, exit")
+
+    p_scan = sub.add_parser("scan",
+                            help="Run a wideband scan and dump spectrum to CSV")
+    p_scan.add_argument("--start", type=float, default=2400,
+                        help="Start frequency in MHz (default: 2400)")
+    p_scan.add_argument("--stop", type=float, default=2500,
+                        help="Stop frequency in MHz (default: 2500)")
+    p_scan.add_argument("--step", type=float, default=50,
+                        help="Segment step in MHz (default: 50)")
+    p_scan.add_argument("--gain", type=int, default=30,
+                        help="RX gain in dB, 0–60 (default: 30)")
+    p_scan.add_argument("--fft-size", type=int, default=4096,
+                        choices=[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+                        help="FFT size (default: 4096)")
+    p_scan.add_argument("--rx-channel", type=int, default=1, choices=[1, 2],
+                        help="RX channel 1 or 2 (default: 1)")
+    p_scan.add_argument("--duration", type=float, default=5,
+                        help="How long to scan, in seconds (default: 5)")
+    p_scan.add_argument("--output", default="/tmp/spectrum.csv",
+                        help="Output CSV path (default: /tmp/spectrum.csv)")
+    p_scan.add_argument("--cal-file", default=None,
+                        help="Path to a .npz calibration file produced by the "
+                             "'calibrate' command (or GUI Save Calibration). "
+                             "Applies filter-shape correction to the scan.")
+
+    p_cal = sub.add_parser("calibrate",
+                           help="Run filter-flattening calibration and save the profile")
+    p_cal.add_argument("--freq", type=float, default=2700,
+                       help="Center frequency in MHz; pick a quiet band "
+                            "(default: 2700)")
+    p_cal.add_argument("--sample-rate", type=float, default=30,
+                       help="Sample rate in MHz (default: 30)")
+    p_cal.add_argument("--fft-size", type=int, default=4096,
+                       choices=[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
+                       help="FFT size (default: 4096)")
+    p_cal.add_argument("--gain", type=int, default=40,
+                       help="RX gain in dB, 0–60 (default: 40)")
+    p_cal.add_argument("--averages", type=int, default=200,
+                       help="Number of spectra to average (default: 200)")
+    p_cal.add_argument("--output", default="/tmp/bladerf_cal.npz",
+                       help="Output .npz path (default: /tmp/bladerf_cal.npz)")
+
+    p_iq = sub.add_parser("iq", help="Record IQ samples to file")
+    p_iq.add_argument("--freq", type=float, default=2400,
+                      help="Center frequency in MHz (default: 2400)")
+    p_iq.add_argument("--duration", type=int, default=200,
+                      help="Capture duration in ms (default: 200)")
+    p_iq.add_argument("--gain", type=int, default=30,
+                      help="RX gain in dB (default: 30)")
+    p_iq.add_argument("--output", default="/tmp/iq.npy",
+                      help="Output path; extension picks format "
+                           "(.npy / .bin / .csv). Default: /tmp/iq.npy")
+
+    p_tx = sub.add_parser("tx", help="Transmit a single 1 kHz-offset tone")
+    p_tx.add_argument("--freq", type=float, default=2400,
+                      help="TX center frequency in MHz (default: 2400)")
+    p_tx.add_argument("--gain", type=int, default=10,
+                      help="TX gain in dB (default: 10)")
+    p_tx.add_argument("--tx-channel", type=int, default=1, choices=[1, 2],
+                      help="TX channel 1 or 2 (default: 1)")
+    p_tx.add_argument("--duration", type=float, default=2,
+                      help="Transmit time in seconds (default: 2)")
+
+    return p
+
+
 def main():
     """Main application entry point"""
-
-    print("=================================================================")
-    print("BladeRF 2.0 Wideband Spectrum Analyzer - Starting...")
-    print("=================================================================")
+    args = _build_arg_parser().parse_args()
 
     QLocale.setDefault(QLocale("C"))
-    print("Qt locale set")
 
     if getattr(sys, 'frozen', False):
         base_path = os.path.dirname(sys.executable)
-        print(f"Running as frozen executable from: {base_path}")
     else:
         base_path = os.path.dirname(os.path.abspath(__file__))
-        print(f"Running as script from: {base_path}")
 
     log_filename = datetime.now().strftime("log_%Y-%m-%d_%H-%M-%S.txt")
     log_path = os.path.join(base_path, log_filename)
@@ -1695,11 +2122,16 @@ def main():
 
     print(f"=================================================================")
     print(f"BladeRF 2.0 Wideband Spectrum Analyzer")
+    print(f"Mode: {'headless:' + args.command if args.command else 'GUI'}")
     print(f"Log file: {log_path}")
     print(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Python version: {sys.version}")
     print(f"=================================================================")
 
+    if args.command is not None:
+        sys.exit(run_headless(args))
+
+    # ---- GUI mode (default) ----
     print("Creating QApplication...")
     app = QApplication(sys.argv)
     print("QApplication created")
