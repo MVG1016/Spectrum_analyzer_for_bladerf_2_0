@@ -1,0 +1,9 @@
+# Python runtime deps. The bladerf/ Python binding is vendored in-tree,
+# but it loads libbladeRF.so via cffi — install the system library too:
+#   sudo apt install libbladerf2 bladerf bladerf-fpga-hostedxa9
+# (or hostedx40 / hostedxA4 / hostedxA9 depending on your variant).
+
+numpy>=1.20
+PyQt5>=5.15
+pyqtgraph>=0.12
+cffi>=1.15
