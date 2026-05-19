@@ -27,8 +27,6 @@ Before using app you need to install all the necessary drivers and dll files for
 
 
 ## To Do list
-
-- Split one main.py file into several for convenience
 - Add ability to save and recover default values on GUI
 - Add support for USRP SDRs
 
