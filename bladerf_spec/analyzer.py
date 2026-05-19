@@ -728,90 +728,95 @@ class SpectrumAnalyzer(QMainWindow):
     # =========================================================================
 
     def run_calibration(self, averages: int = 200):
-        """
-        Average N spectra at the current frequency → AЧХ (filter-shape) profile.
-        Profile is normalized so the middle third of the segment = 0 dB.
-        From then on each segment gets corrected against this profile.
-        """
         if not self.is_connected:
             QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
             return
-
         if self.sdr is None:
             QMessageBox.warning(self, "Error", "BladeRF not initialized")
             return
-
         if self.live_scanning:
+            QMessageBox.warning(self, "Error", "Stop scanning before calibration")
+            return
+        if self.wb_centers is None or len(self.wb_centers) == 0:
             QMessageBox.warning(self, "Error",
-                                "Stop scanning before calibration")
+                                "Configure scan range first and press Start/Pause before calibrating")
             return
 
         self.calibrating = True
         self.calibrate_button.setEnabled(False)
-        self.calibrate_status_label.setText("Calibrating...")
+        self.segment_correction = None
+        self.segment_correction_map = {}
         QApplication.processEvents()
 
         CAL_AVERAGES = int(averages)
+        total_centers = len(self.wb_centers)
 
         try:
-            # Сначала сбрасываем буфер
-            flush_buf = bytearray(self.config.num_samples * 4)
-            flush_count = (self.config.SYNC_NUM_BUFFERS *
-                           self.config.BUFFER_SIZE_MULTIPLIER + 4)
-            with self.sdr_lock:
-                for _ in range(flush_count):
-                    try:
-                        self.sdr.sync_rx(flush_buf, self.config.num_samples)
-                    except Exception:
-                        break
+            for ci, center_hz in enumerate(self.wb_centers):
+                self.calibrate_status_label.setText(
+                    f"Calibrating {ci + 1}/{total_centers}  {center_hz / 1e6:.1f} MHz...")
+                QApplication.processEvents()
 
-            # Накапливаем в линейной шкале для корректного усреднения
-            accum = np.zeros(self.config.num_samples, dtype=np.float64)
+                with self.sdr_lock:
+                    self.rx_channel.frequency = int(center_hz)
+                    self.center_freq = center_hz
+                    flush_buf = bytearray(self.config.num_samples * 4)
+                    flush_count = (self.config.SYNC_NUM_BUFFERS *
+                                   self.config.BUFFER_SIZE_MULTIPLIER + 4)
+                    for _ in range(flush_count):
+                        try:
+                            self.sdr.sync_rx(flush_buf, self.config.num_samples)
+                        except Exception:
+                            break
 
-            for i in range(CAL_AVERAGES):
-                _, power_dbm = self.acquire_one_spectrum()
-                # Переводим в линейный масштаб перед суммированием
-                accum += 10.0 ** (power_dbm / 10.0)
+                accum = np.zeros(self.config.num_samples, dtype=np.float64)
 
-                if i % 20 == 0:
-                    self.calibrate_status_label.setText(
-                        f"Calibrating... {i}/{CAL_AVERAGES}")
-                    QApplication.processEvents()
+                for i in range(CAL_AVERAGES):
+                    _, power_dbm = self.acquire_one_spectrum()
 
-            # Средний профиль в дБ
-            avg_profile = 10.0 * np.log10(accum / CAL_AVERAGES)
+                    # Детальная диагностика первого кадра каждого сегмента
+                    if i == 0:
+                        nan_count = np.sum(~np.isfinite(power_dbm))
+                        print(f"  Seg {ci + 1} frame 0: shape={power_dbm.shape} "
+                              f"dtype={power_dbm.dtype} "
+                              f"min={np.nanmin(power_dbm):.1f} "
+                              f"max={np.nanmax(power_dbm):.1f} "
+                              f"nan={nan_count}")
 
-            # Опорный уровень = медиана центральной трети (там фильтр ровный)
-            n = len(avg_profile)
-            center_slice = slice(n // 3, 2 * n // 3)
-            ref_level = np.median(avg_profile[center_slice])
+                    power_dbm = np.where(np.isfinite(power_dbm), power_dbm, -140.0)
+                    accum += power_dbm
 
-            # Коррекция = сколько надо вычесть из каждого бина
-            # Положительная коррекция опускает бин, отрицательная поднимает
-            self.segment_correction = avg_profile - ref_level
+                    if i % 20 == 0:
+                        self.calibrate_status_label.setText(
+                            f"Calibrating {ci + 1}/{total_centers}  "
+                            f"{center_hz / 1e6:.1f} MHz  {i}/{CAL_AVERAGES}")
+                        QApplication.processEvents()
 
-            peak_correction = max(abs(self.segment_correction.min()),
-                                  abs(self.segment_correction.max()))
-            edge_left  = self.segment_correction[:n // 8].mean()
-            edge_right = self.segment_correction[-n // 8:].mean()
+                avg_profile = accum / CAL_AVERAGES
+                print(f"  Seg {ci + 1} avg_profile: "
+                      f"min={np.nanmin(avg_profile):.1f} "
+                      f"max={np.nanmax(avg_profile):.1f} "
+                      f"nan={np.sum(~np.isfinite(avg_profile))}")
 
-            print(f"Calibration done.")
-            print(f"  Ref level: {ref_level:.1f} dBm")
-            print(f"  Profile range: {self.segment_correction.min():.2f} .. "
-                  f"{self.segment_correction.max():.2f} dB")
-            print(f"  Edge correction left={edge_left:.2f} dB  "
-                  f"right={edge_right:.2f} dB")
+                avg_profile = np.where(np.isfinite(avg_profile), avg_profile, -140.0)
 
-            self.calibrate_status_label.setText(
-                f"OK  peak±{peak_correction:.1f} dB  "
-                f"L{edge_left:+.1f} R{edge_right:+.1f} dB"
-            )
+                n = len(avg_profile)
+                ref_level = np.median(avg_profile[n // 3: 2 * n // 3])
+                print(f"  Seg {ci + 1} ref_level={ref_level:.1f}")
+
+                correction = avg_profile - ref_level
+                self.segment_correction_map[center_hz] = correction
+
+            self.segment_correction = list(self.segment_correction_map.values())[-1]
+            self.calibrate_status_label.setText(f"OK  {total_centers} segments calibrated")
+            print(f"Calibration done: {total_centers} segments")
 
         except Exception as e:
             print(f"Calibration error: {e}")
             import traceback
             traceback.print_exc()
             self.segment_correction = None
+            self.segment_correction_map = {}
             self.calibrate_status_label.setText(f"Error: {e}")
 
         finally:
@@ -1141,13 +1146,19 @@ class SpectrumAnalyzer(QMainWindow):
                 self.maxhold_curve.clear()
 
             if self.composite_spectrum.size > 0:
-                idx = np.argmax(self.composite_spectrum)
-                f = self.common_freq[idx]
-                p = self.composite_spectrum[idx]
-
-                self.max_marker.setData([f], [p])
-                self.max_text.setText(f"{f:.2f} MHz\n{p:.1f} dBm")
-                self.max_text.setPos(f, p)
+                finite_mask = np.isfinite(self.composite_spectrum)
+                if finite_mask.any():
+                    masked = np.where(finite_mask, self.composite_spectrum, -np.inf)
+                    idx = np.argmax(masked)
+                    f = self.common_freq[idx]
+                    p = self.composite_spectrum[idx]
+                    if np.isfinite(f) and np.isfinite(p):
+                        self.max_marker.setData([f], [p])
+                        self.max_text.setText(f"{f:.2f} MHz\n{p:.1f} dBm")
+                        self.max_text.setPos(f, p)
+                else:
+                    self.max_marker.setData([], [])
+                    self.max_text.setText("")
 
             row_data = np.interp(
                 np.linspace(self.common_freq[0], self.common_freq[-1],
