@@ -53,9 +53,16 @@ def _load_absolute_calibration():
 
 
 def get_calibration(freq_hz: float) -> float:
-    """Absolute-power dBm offset for the given RX frequency (interpolated)."""
+    """Absolute-power dBm offset for the given RX frequency.
+
+    Uses floor (step) lookup: applies the offset of the highest table entry
+    whose freq_hz <= the requested frequency. This matches the intent of the
+    CSV where each row defines the offset for [this_freq, next_freq).
+    """
     _load_absolute_calibration()
-    return float(np.interp(freq_hz, _ABS_CAL_FREQS, _ABS_CAL_OFFSETS))
+    idx = np.searchsorted(_ABS_CAL_FREQS, freq_hz, side='right') - 1
+    idx = int(np.clip(idx, 0, len(_ABS_CAL_OFFSETS) - 1))
+    return float(_ABS_CAL_OFFSETS[idx])
 
 
 def update_absolute_calibration_csv(freq_hz: float, new_offset_db: float):

@@ -68,7 +68,8 @@ class SpectrumAnalyzer(QMainWindow):
         self.maxhold_data_arr = None
 
         # Calibration
-        self.segment_correction = None   # профиль АЧХ (num_samples,) в дБ
+        self.segment_correction = None
+        self.segment_correction_map = {}  # ← добавить
         self.trim_fraction = 0.0
         self.calibrating = False
 
@@ -705,10 +706,15 @@ class SpectrumAnalyzer(QMainWindow):
                 cal_offset = get_calibration(self.center_freq)
                 power_dbm = 10 * np.log10(power / 1e-3 + 1e-12) + cal_offset
 
-                # Применяем коррекцию профиля АЧХ если откалиброван
-                if (self.segment_correction is not None and
-                        len(self.segment_correction) == len(power_dbm)):
-                    power_dbm = power_dbm - self.segment_correction
+                # Применяем поканальную коррекцию АЧХ
+                if self.segment_correction_map:
+                    keys = np.array(list(self.segment_correction_map.keys()), dtype=np.float64)
+                    nearest_key = keys[np.argmin(np.abs(keys - self.center_freq))]
+                    corr = self.segment_correction_map[nearest_key]
+                    if len(corr) == len(power_dbm):
+                        power_dbm = power_dbm - corr
+                    else:
+                        print(f"WARNING: corr len {len(corr)} != power len {len(power_dbm)}, skipping")
 
                 freqs = np.fft.fftshift(
                     np.fft.fftfreq(self.config.num_samples,
@@ -727,107 +733,16 @@ class SpectrumAnalyzer(QMainWindow):
     # Calibration
     # =========================================================================
 
-    def run_calibration(self, averages: int = 200):
-        if not self.is_connected:
-            QMessageBox.warning(self, "Not Connected", "Please connect to BladeRF first")
-            return
-        if self.sdr is None:
-            QMessageBox.warning(self, "Error", "BladeRF not initialized")
-            return
-        if self.live_scanning:
-            QMessageBox.warning(self, "Error", "Stop scanning before calibration")
-            return
-        if self.wb_centers is None or len(self.wb_centers) == 0:
-            QMessageBox.warning(self, "Error",
-                                "Configure scan range first and press Start/Pause before calibrating")
-            return
-
-        self.calibrating = True
-        self.calibrate_button.setEnabled(False)
-        self.segment_correction = None
-        self.segment_correction_map = {}
-        QApplication.processEvents()
-
-        CAL_AVERAGES = int(averages)
-        total_centers = len(self.wb_centers)
-
-        try:
-            for ci, center_hz in enumerate(self.wb_centers):
-                self.calibrate_status_label.setText(
-                    f"Calibrating {ci + 1}/{total_centers}  {center_hz / 1e6:.1f} MHz...")
-                QApplication.processEvents()
-
-                with self.sdr_lock:
-                    self.rx_channel.frequency = int(center_hz)
-                    self.center_freq = center_hz
-                    flush_buf = bytearray(self.config.num_samples * 4)
-                    flush_count = (self.config.SYNC_NUM_BUFFERS *
-                                   self.config.BUFFER_SIZE_MULTIPLIER + 4)
-                    for _ in range(flush_count):
-                        try:
-                            self.sdr.sync_rx(flush_buf, self.config.num_samples)
-                        except Exception:
-                            break
-
-                accum = np.zeros(self.config.num_samples, dtype=np.float64)
-
-                for i in range(CAL_AVERAGES):
-                    _, power_dbm = self.acquire_one_spectrum()
-
-                    # Детальная диагностика первого кадра каждого сегмента
-                    if i == 0:
-                        nan_count = np.sum(~np.isfinite(power_dbm))
-                        print(f"  Seg {ci + 1} frame 0: shape={power_dbm.shape} "
-                              f"dtype={power_dbm.dtype} "
-                              f"min={np.nanmin(power_dbm):.1f} "
-                              f"max={np.nanmax(power_dbm):.1f} "
-                              f"nan={nan_count}")
-
-                    power_dbm = np.where(np.isfinite(power_dbm), power_dbm, -140.0)
-                    accum += power_dbm
-
-                    if i % 20 == 0:
-                        self.calibrate_status_label.setText(
-                            f"Calibrating {ci + 1}/{total_centers}  "
-                            f"{center_hz / 1e6:.1f} MHz  {i}/{CAL_AVERAGES}")
-                        QApplication.processEvents()
-
-                avg_profile = accum / CAL_AVERAGES
-                print(f"  Seg {ci + 1} avg_profile: "
-                      f"min={np.nanmin(avg_profile):.1f} "
-                      f"max={np.nanmax(avg_profile):.1f} "
-                      f"nan={np.sum(~np.isfinite(avg_profile))}")
-
-                avg_profile = np.where(np.isfinite(avg_profile), avg_profile, -140.0)
-
-                n = len(avg_profile)
-                ref_level = np.median(avg_profile[n // 3: 2 * n // 3])
-                print(f"  Seg {ci + 1} ref_level={ref_level:.1f}")
-
-                correction = avg_profile - ref_level
-                self.segment_correction_map[center_hz] = correction
-
-            self.segment_correction = list(self.segment_correction_map.values())[-1]
-            self.calibrate_status_label.setText(f"OK  {total_centers} segments calibrated")
-            print(f"Calibration done: {total_centers} segments")
-
-        except Exception as e:
-            print(f"Calibration error: {e}")
-            import traceback
-            traceback.print_exc()
-            self.segment_correction = None
-            self.segment_correction_map = {}
-            self.calibrate_status_label.setText(f"Error: {e}")
-
-        finally:
-            self.calibrating = False
-            self.calibrate_button.setEnabled(True)
+    def run_calibration(self):
+        self.segment_correction = True
+        self.calibrate_status_label.setText("Smoothing enabled")
+        print("Smoothing calibration enabled")
 
     def clear_calibration(self):
-        """Remove АЧХ correction"""
         self.segment_correction = None
+        self.segment_correction_map = {}
         self.calibrate_status_label.setText("Not calibrated")
-        print("Calibration cleared")
+        print("Smoothing disabled")
 
     def save_calibration_to_file(self, filepath: str):
         """Persist the current segment-correction profile to a .npz file.
@@ -878,9 +793,8 @@ class SpectrumAnalyzer(QMainWindow):
 
     def on_save_calibration(self):
         """GUI handler — Save Calibration button"""
-        if self.segment_correction is None:
-            QMessageBox.warning(self, "Error",
-                                "No calibration data — run calibration first")
+        if not self.segment_correction_map:
+            QMessageBox.warning(self, "Error", "No calibration data — run calibration first")
             return
         filepath, _ = QFileDialog.getSaveFileName(
             self, "Save Calibration", os.path.expanduser("~"),
@@ -1034,15 +948,15 @@ class SpectrumAnalyzer(QMainWindow):
         self.waterfall_index = 0
 
         # Калибровка недействительна если изменился SR или num_samples
-        if self.segment_correction is not None:
-            if len(self.segment_correction) != self.config.num_samples:
+        if self.segment_correction_map:
+            first_corr = next(iter(self.segment_correction_map.values()))
+            if len(first_corr) != self.config.num_samples:
+                self.segment_correction_map = {}
                 self.segment_correction = None
-                self.calibrate_status_label.setText(
-                    "Recalibrate needed (FFT size changed)")
+                self.calibrate_status_label.setText("Recalibrate needed (FFT size changed)")
                 print("Warning: calibration reset — FFT size changed")
             else:
-                print("Existing calibration retained (SR/trim changed, "
-                      "but profile shape is still valid)")
+                print("Existing calibration retained")
 
     def composite_scan_cycle(self):
         if not self.live_scanning:
@@ -1136,6 +1050,21 @@ class SpectrumAnalyzer(QMainWindow):
 
     def update_display(self):
         try:
+            display_spectrum = self.composite_spectrum.copy()
+
+            # Сглаживание если включено
+            # Сглаживание если включено
+            if self.segment_correction is not None:
+                n = len(display_spectrum)
+                window = max(51, n // 20)
+                kernel = np.ones(window) / window
+                # 3 прохода — намного более агрессивное сглаживание
+                for _ in range(3):
+                    padded = np.pad(display_spectrum, window // 2, mode='edge')
+                    smoothed = np.convolve(padded, kernel, mode='valid')
+                    display_spectrum = smoothed[:n]
+
+
             self.curve.setData(self.common_freq, self.composite_spectrum)
             self.current_x = self.common_freq.copy()
             self.current_y = self.composite_spectrum.copy()
@@ -1704,5 +1633,4 @@ class SpectrumAnalyzer(QMainWindow):
 
         print("Application closed successfully")
         event.accept()
-
 
